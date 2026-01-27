@@ -34,8 +34,8 @@ uv pip install -e .
 
 # ========== 6. install Flash Attention (Optional but recommended) ==========
 
-# pip install flash-attn --no-build-isolation 
-# It will automatically download the latest flash-attn, which is version 2.8.3 as of January 26, 2026. It is incompatible with newer versions of CUDA. You need to find a compatible downgraded version on the official website. 
+# pip install flash-attn --no-build-isolation
+# It will automatically download the latest flash-attn, which is version 2.8.3 as of January 26, 2026. It is incompatible with newer versions of CUDA. You need to find a compatible downgraded version on the official website.
 
 # Fortunately, we have found one for you.
 
@@ -122,8 +122,8 @@ Pure text generation:
 python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --modality text2text \
                   --prompts "What is the capital of France?"
-                  
-# You can load prompts from a text file (one prompt per line):                
+
+# You can load prompts from a text file (one prompt per line):  
 python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --modality text2img \
                   --txt-prompts /path/to/prompts.txt

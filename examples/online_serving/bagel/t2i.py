@@ -1,15 +1,13 @@
-from openai import OpenAI
 import base64
+
+from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
 
 response = client.chat.completions.create(
     model="ByteDance-Seed/BAGEL-7B-MoT",
-    messages=[{
-        "role": "user",
-        "content": [{"type": "text", "text": "<|im_start|>A cute cat<|im_end|>"}]
-    }],
-    extra_body={"modalities": ["image"]}
+    messages=[{"role": "user", "content": [{"type": "text", "text": "<|im_start|>A cute cat<|im_end|>"}]}],
+    extra_body={"modalities": ["image"]},
 )
 
 # Extract and save image from response
