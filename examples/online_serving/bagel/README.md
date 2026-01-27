@@ -9,15 +9,19 @@ Please refer to [README.md](../../../README.md)
 ### Launch the Server
 
 ```bash
+# Use default configuration (requires two GPUs)
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091
 ```
 
 Or use the convenience script:
+
 ```bash
+cd /workspace/vllm-omni/examples/online_serving/bagel
 bash run_server.sh
 ```
 
 If you have a custom stage configs file, launch the server with the command below:
+
 ```bash
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /path/to/stage_configs_file
 ```
@@ -25,11 +29,12 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /
 ### Send Multi-modal Request
 
 Get into the example folder:
+
 ```bash
 cd examples/online_serving/bagel
 ```
 
-#### Send request via Python
+Send request via Python
 
 ```bash
 python openai_chat_client.py --prompt "A cute cat" --modality text2img
@@ -50,22 +55,25 @@ The Python client supports the following command-line arguments:
 
 ## Modality Control
 
-BAGEL-7B-MoT supports multiple modality modes for different use cases.
+BAGEL-7B-MoT supports **multiple modality modes** for different use cases.
 
-### Supported Modalities
+The default yaml configuration deploys Thinker and DiT on different GPUs. If you only have one GPU, you can use the single-GPU configuration file:
 
-| Modality | Input | Output | Description |
-|----------|-------|--------|-------------|
-| `text2img` | Text | Image | Generate images from text prompts |
-| `img2img` | Image + Text | Image | Transform images using text guidance |
-| `img2text` | Image + Text | Text | Generate text descriptions from images |
-| `text2text` | Text | Text | Pure text generation |
+- **Dual GPU**: [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)
+- **Single GPU**: [`bagel_single_gpu.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel_single_gpu.yaml)
+
+| Modality    | Input        | Output | Description                            |
+| ----------- | ------------ | ------ | -------------------------------------- |
+| `text2img`  | Text         | Image  | Generate images from text prompts      |
+| `img2img`   | Image + Text | Image  | Transform images using text guidance   |
+| `img2text`  | Image + Text | Text   | Generate text descriptions from images |
+| `text2text` | Text         | Text   | Pure text generation                   |
 
 ### Text to Image (text2img)
 
 Generate images from text prompts:
 
-#### Using Python client
+**Using Python client**
 
 ```bash
 python openai_chat_client.py \
@@ -75,7 +83,7 @@ python openai_chat_client.py \
     --steps 50
 ```
 
-#### Using curl
+**Using curl**
 
 ```bash
 curl http://localhost:8091/v1/chat/completions \
@@ -87,93 +95,7 @@ curl http://localhost:8091/v1/chat/completions \
   }'
 ```
 
-### Image to Image (img2img)
-
-Transform images based on text prompts:
-
-#### Using Python client
-
-```bash
-python openai_chat_client.py \
-    --prompt "Make it more colorful and vibrant" \
-    --modality img2img \
-    --image-url /path/to/input.jpg \
-    --output transformed.png
-```
-
-#### Using curl
-
-```bash
-curl http://localhost:8091/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{
-      "role": "user",
-      "content": [
-        {"type": "text", "text": "<|im_start|>Make it more colorful<|im_end|>"},
-        {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
-      ]
-    }],
-    "modalities": ["image"]
-  }'
-```
-
-### Image to Text (img2text)
-
-Generate text descriptions from images:
-
-#### Using Python client
-
-```bash
-python openai_chat_client.py \
-    --prompt "Describe this image in detail" \
-    --modality img2text \
-    --image-url /path/to/image.jpg
-```
-
-#### Using curl
-
-```bash
-curl http://localhost:8091/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{
-      "role": "user",
-      "content": [
-        {"type": "text", "text": "<|im_start|>user\n<|image_pad|>\nDescribe this image<|im_end|>\n<|im_start|>assistant\n"},
-        {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
-      ]
-    }],
-    "modalities": ["text"]
-  }'
-```
-
-### Text to Text (text2text)
-
-Pure text generation:
-
-#### Using Python client
-
-```bash
-python openai_chat_client.py \
-    --prompt "What is the capital of France?" \
-    --modality text2text
-```
-
-#### Using curl
-
-```bash
-curl http://localhost:8091/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"}]}],
-    "modalities": ["text"]
-  }'
-```
-
-## Using OpenAI Python SDK
-
-### Text to Image
+**Using OpenAI Python SDK**
 
 ```python
 from openai import OpenAI
@@ -198,7 +120,34 @@ if isinstance(content, list) and "image_url" in content[0]:
         f.write(base64.b64decode(img_data))
 ```
 
-### Image to Text
+### Image to Image (img2img)
+
+Transform images based on text prompts:
+
+**Using Python client**
+
+```bash
+python openai_chat_client.py \
+    --prompt "Make the cat stand up" \
+    --modality img2img \
+    --image-url /path/to/input.jpg \
+    --output transformed.png
+```
+
+### Image to Text (img2text)
+
+Generate text descriptions from images:
+
+**Using Python client**
+
+```bash
+python openai_chat_client.py \
+    --prompt "Describe this image in detail" \
+    --modality img2text \
+    --image-url /path/to/image.jpg
+```
+
+**Using OpenAI Python SDK**
 
 ```python
 from openai import OpenAI
@@ -220,17 +169,40 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+### Text to Text (text2text)
+
+Pure text generation:
+
+**Using Python client**
+
+```bash
+python openai_chat_client.py \
+    --prompt "What is the capital of France?" \
+    --modality text2text
+```
+
+**Using curl**
+
+```bash
+curl http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"}]}],
+    "modalities": ["text"]
+  }'
+```
+
 ## Generation Parameters
 
 You can customize image generation with these parameters:
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `height` | Image height in pixels | 512 |
-| `width` | Image width in pixels | 512 |
-| `num_inference_steps` | Number of diffusion steps | 25 |
-| `seed` | Random seed for reproducibility | None |
-| `negative_prompt` | Negative prompt for image generation | None |
+| Parameter             | Description                          | Default |
+| --------------------- | ------------------------------------ | ------- |
+| `height`              | Image height in pixels               | 512     |
+| `width`               | Image width in pixels                | 512     |
+| `num_inference_steps` | Number of diffusion steps            | 25      |
+| `seed`                | Random seed for reproducibility      | None    |
+| `negative_prompt`     | Negative prompt for image generation | None    |
 
 Example with custom parameters:
 
@@ -248,6 +220,7 @@ python openai_chat_client.py \
 ## FAQ
 
 If you encounter an error about the backend of librosa, try to install ffmpeg with the command below:
+
 ```bash
 sudo apt update
 sudo apt install ffmpeg
