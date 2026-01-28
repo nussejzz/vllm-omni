@@ -8,6 +8,8 @@ Please refer to [README.md](../../../README.md)
 
 ## Run examples (BAGEL-7B-MoT)
 
+**Note**: These examples work with the default configuration on an **NVIDIA A100 (80GB)**. We also tested on dual **NVIDIA RTX 5000 Ada (32GB each)**. For dual-GPU setups, please modify the [stage configuration](../../../configuration/stage_configs.md) to distribute the model across devices.
+
 ### Launch the Server
 
 ```bash
@@ -226,9 +228,17 @@ python openai_chat_client.py \
 
 ## FAQ
 
-If you encounter an error about the backend of librosa, try to install ffmpeg with the command below:
+- If you encounter an error about the backend of librosa, try to install ffmpeg with the command below.
 
 ```bash
 sudo apt update
 sudo apt install ffmpeg
 ```
+
+- If you don’t know how much VRAM is needed for the model or encounter the OOM error, you can try to decrease the max_model_len.
+
+| Stage               | VRAM                         |
+| :------------------ | :--------------------------- |
+| Stage-0 (Thinker)   | **15.04 GiB** **+ KV Cache** |
+| Stage-1 (DiT)       | **26.50 GiB**                |
+| Total               | **~42 GiB + KV Cache**       |

@@ -2,11 +2,14 @@
 
 Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inference/bagel>.
 
+
 ## Set up
 
 Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
 
 ## Run examples
+
+**Note**: These examples work with the default configuration on an **NVIDIA A100 (80GB)**. We also tested on dual **NVIDIA RTX 5000 Ada (32GB each)**. For dual-GPU setups, please modify the [stage configuration](../../../configuration/stage_configs.md) to distribute the model across devices.
 
 Get into the example folder
 
