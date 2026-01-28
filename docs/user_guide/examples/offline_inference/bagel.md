@@ -6,48 +6,6 @@ Source <https://github.com/vllm-project/vllm-omni/tree/main/examples/offline_inf
 
 Please refer to the [stage configuration documentation](https://docs.vllm.ai/projects/vllm-omni/en/latest/configuration/stage_configs/) to configure memory allocation appropriately for your hardware setup.
 
-## Quick start
-
-We recommend configuring a virtual environment using UV.
-
-```
-# ========== 1. create virtual env ==========
-
-python -m venv /workspace/vllm-omni-env
-
-# ========== 2. activate virtual env ==========
-
-source /workspace/vllm-omni-env/bin/activate
-
-# ========== 3. install uv (Quick Package Manager) ==========
-
-pip install uv
-
-# ========== 4. install vLLM ==========
-
-uv pip install vllm==0.14.0 --torch-backend=auto
-
-# ========== 5. clone & install vLLM-Omni ==========
-
-cd /workspace
-git clone https://github.com/vllm-project/vllm-omni.git
-cd vllm-omni
-uv pip install -e .
-
-# ========== 6. install Flash Attention (Optional but recommended) ==========
-
-# pip install flash-attn --no-build-isolation
-# It will automatically download the latest flash-attn, which is version 2.8.3 as of January 26, 2026. It is incompatible with newer versions of CUDA. You need to find a compatible downgraded version on the official website.
-
-# Fortunately, we have found one for you.
-
-uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
-
-# ========== 7. install Hugging Face accelerator ==========
-
-uv pip install hf_transfer
-```
-
 ## Run examples
 
 Get into the example folder
@@ -210,12 +168,6 @@ sudo apt update
 sudo apt install ffmpeg
 ```
 
-- If you encounter warnings about flash_attn, try to install lower version like 2.8.1 with the command below.
-
-```
-uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
-```
-
 - If you don’t know how much VRAM is needed for the model or encounter the OOM error, you can try to decrease the max_model_len.
 
 | Stage               | VRAM                         |
@@ -223,22 +175,3 @@ uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2
 | Stage-0 (Thinker)   | **15.04 GiB** **+ KV Cache** |
 | Stage-1 (DiT)       | **26.50 GiB**                |
 | Total               | **~42 GiB + KV Cache**       |
-
-**KV Cache Memory Calculation**
-
-$$M_{\text{KV\_Cache}} = 2 \times L \times H \times S \times B \times D$$
-
-| Symbol | Description                       | BAGEL-7B Reference Value                                     |
-| :----- | :-------------------------------- | :----------------------------------------------------------- |
-| $L$    | Number of Layers                  | 32                                                           |
-| $H$    | Hidden Dimension                  | 4096                                                         |
-| $S$    | Sequence Length (`max_model_len`) | 32768 Default. Customizable (e.g., 8192) if VRAM is insufficient, but may result in performance/quality degradation. |
-| $B$    | Batch Size                        | 1                                                            |
-| $D$    | Data Type Bytes                   | 2 (BF16)                                                     |
-
-```
-# For example
-KV Cache = 2 × 32 × 4096 × 32768 × 1 × 2 / 1024 / 1024 /1024
-
-         = 16 GB
-```
