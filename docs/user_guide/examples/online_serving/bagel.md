@@ -59,10 +59,7 @@ The Python client supports the following command-line arguments:
 
 BAGEL-7B-MoT supports **multiple modality modes** for different use cases.
 
-The default yaml configuration deploys Thinker and DiT on different GPUs. If you only have one GPU, you can use the single-GPU configuration file:
-
-- **Dual GPU**: [`bagel.yaml`](../../../../vllm_omni/model_executor/stage_configs/bagel.yaml)
-- **Single GPU**: [`bagel_single_gpu.yaml`](../../../../vllm_omni/model_executor/stage_configs/bagel_single_gpu.yaml)
+The default yaml configuration deploys Thinker and DiT on the same GPU. You can use the default configuration file: [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)
 
 | Modality    | Input        | Output | Description                            |
 | ----------- | ------------ | ------ | -------------------------------------- |
@@ -93,34 +90,13 @@ curl http://localhost:8091/v1/chat/completions \
   -d '{
     "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>A beautiful sunset over mountains<|im_end|>"}]}],
     "modalities": ["image"],
-    "num_inference_steps": 50
+    "height": 512,
+    "width": 512,
+    "num_inference_steps": 50,
+    "seed": 42
   }'
 ```
 
-**Using OpenAI Python SDK**
-
-```python
-from openai import OpenAI
-import base64
-
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
-
-response = client.chat.completions.create(
-    model="ByteDance-Seed/BAGEL-7B-MoT",
-    messages=[{
-        "role": "user",
-        "content": [{"type": "text", "text": "<|im_start|>A cute cat<|im_end|>"}]
-    }],
-    extra_body={"modalities": ["image"]}
-)
-
-# Extract and save image from response
-content = response.choices[0].message.content
-if isinstance(content, list) and "image_url" in content[0]:
-    img_data = content[0]["image_url"]["url"].split(",")[1]
-    with open("output.png", "wb") as f:
-        f.write(base64.b64decode(img_data))
-```
 
 ### Image to Image (img2img)
 
@@ -136,6 +112,34 @@ python openai_chat_client.py \
     --output transformed.png
 ```
 
+**Using curl**
+
+```bash
+IMAGE_BASE64=$(base64 -w 0 cat.jpg)
+
+cat <<EOF > payload.json
+{
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "<|im_start|>Make the cat stand up<|im_end|>"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,${IMAGE_BASE64}"}}
+      ]
+    }],
+    "modalities": ["image"],
+    "height": 512,
+    "width": 512,
+    "num_inference_steps": 50,
+    "seed": 42
+}
+EOF
+
+curl http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d @payload.json
+
+```
+
 ### Image to Text (img2text)
 
 Generate text descriptions from images:
@@ -149,26 +153,27 @@ python openai_chat_client.py \
     --image-url /path/to/image.jpg
 ```
 
-**Using OpenAI Python SDK**
+**Using curl**
 
-```python
-from openai import OpenAI
+```bash
+IMAGE_BASE64=$(base64 -w 0 cat.jpg)
 
-client = OpenAI(base_url="http://localhost:8091/v1", api_key="EMPTY")
+cat <<EOF > payload.json
+{
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "<|im_start|>user\n<|image_pad|>\nDescribe this image in detail<|im_end|>\n<|im_start|>assistant\n"},
+      {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,${IMAGE_BASE64}"}}
+    ]
+  }],
+  "modalities": ["text"]
+}
+EOF
 
-response = client.chat.completions.create(
-    model="ByteDance-Seed/BAGEL-7B-MoT",
-    messages=[{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "<|im_start|>user\n<|image_pad|>\nDescribe this image<|im_end|>\n<|im_start|>assistant\n"},
-            {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
-        ]
-    }],
-    extra_body={"modalities": ["text"]}
-)
-
-print(response.choices[0].message.content)
+curl http://localhost:8091/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d @payload.json
 ```
 
 ### Text to Text (text2text)

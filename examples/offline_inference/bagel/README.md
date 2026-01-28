@@ -72,10 +72,6 @@ python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --prompts "A cute cat"
 ```
 
-```bash
-bash run_t2i.sh
-```
-
 #### Image to Image (img2img)
 
 - **Pipeline**: Image → VAE Encode → DiT → VAE Decode → New Image
@@ -106,10 +102,6 @@ python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
                   --prompts "Describe this image in detail"
 ```
 
-```bash
-bash run_i2t.sh
-```
-
 #### Text to Text (text2text)
 
 - **Pipeline**: Text → Thinker → Text Output
@@ -125,15 +117,8 @@ python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
 
 # You can load prompts from a text file (one prompt per line):  
 python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
-                  --modality text2img \
+                  --modality text2text \
                   --txt-prompts /path/to/prompts.txt
-```
-
-```bash
-bash run_t2t.sh
-
-# You can load prompts from a text file (one prompt per line):
-bash run_multiple_prompt.sh
 ```
 
 ### Inference Steps
