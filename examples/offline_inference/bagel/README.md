@@ -137,10 +137,7 @@ python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT \
 
 BAGEL-7B-MoT supports **multiple modality modes** for different use cases.
 
-The default yaml configuration deploys Thinker and DiT on different GPUs. If you only have one GPU, you can use the single-GPU configuration file:
-
-- **Dual GPU**: [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)
-- **Single GPU**: [`bagel_single_gpu.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel_single_gpu.yaml)
+The default yaml configuration deploys Thinker and DiT on the same GPU. You can use the default configuration file: [`bagel.yaml`](../../../vllm_omni/model_executor/stage_configs/bagel.yaml)
 
 #### 📌 Command Line Arguments (end2end.py)
 
@@ -221,8 +218,8 @@ uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2
 
 | Stage               | vRAM                         |
 | :------------------ | :--------------------------- |
-| Stage-0 (LLM)       | **15.04 GiB** **+ KV Cache** |
-| Stage-1 (Diffusion) | **26.50 GiB**                |
+| Stage-0 (Thinker)   | **15.04 GiB** **+ KV Cache** |
+| Stage-1 (DiT)       | **26.50 GiB**                |
 | Total               | **~42 GiB + KV Cache**       |
 
 **KV Cache Memory Calculation**
