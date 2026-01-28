@@ -216,9 +216,9 @@ sudo apt install ffmpeg
 uv pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
 ```
 
-- If you don’t know how much vRAM is needed for the model or encounter the OOM error, you can try to decrease the max_model_len.
+- If you don’t know how much VRAM is needed for the model or encounter the OOM error, you can try to decrease the max_model_len.
 
-| Stage               | vRAM                         |
+| Stage               | VRAM                         |
 | :------------------ | :--------------------------- |
 | Stage-0 (Thinker)   | **15.04 GiB** **+ KV Cache** |
 | Stage-1 (DiT)       | **26.50 GiB**                |
@@ -232,7 +232,7 @@ $$M_{\text{KV\_Cache}} = 2 \times L \times H \times S \times B \times D$$
 | :----- | :-------------------------------- | :----------------------------------------------------------- |
 | $L$    | Number of Layers                  | 32                                                           |
 | $H$    | Hidden Dimension                  | 4096                                                         |
-| $S$    | Sequence Length (`max_model_len`) | 32768 Default. Customizable (e.g., 8192) if vRAM is insufficient, but may result in performance/quality degradation. |
+| $S$    | Sequence Length (`max_model_len`) | 32768 Default. Customizable (e.g., 8192) if VRAM is insufficient, but may result in performance/quality degradation. |
 | $B$    | Batch Size                        | 1                                                            |
 | $D$    | Data Type Bytes                   | 2 (BF16)                                                     |
 

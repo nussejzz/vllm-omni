@@ -9,7 +9,7 @@ Please refer to [README.md](../../../README.md)
 ### Launch the Server
 
 ```bash
-# Use default configuration (requires two GPUs)
+# Use default configuration
 vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091
 ```
 
