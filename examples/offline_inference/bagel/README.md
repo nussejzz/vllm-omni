@@ -140,7 +140,7 @@ The default yaml configuration deploys Thinker and DiT on the same GPU. You can 
 | Parameter                        | Value       | Description                 |
 | :------------------------------- | :---------- | :-------------------------- |
 | `stage_type`                     | `diffusion` | Stage type                  |
-| `devices`                        | `"1"`       | GPU device ID               |
+| `devices`                        | `"0"`       | GPU device ID               |
 | `max_batch_size`                 | `1`         | Maximum batch size          |
 | `model_stage`                    | `dit`       | Model stage identifier      |
 | `gpu_memory_utilization`         | `0.4`       | GPU memory utilization      |
