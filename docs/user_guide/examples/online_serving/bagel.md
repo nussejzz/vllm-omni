@@ -8,7 +8,7 @@ Please refer to [README.md](../../../README.md)
 
 ## Run examples (BAGEL-7B-MoT)
 
-**Note**: These examples work with the default configuration on an **NVIDIA A100 (80GB)**. We also tested on dual **NVIDIA RTX 5000 Ada (32GB each)**. For dual-GPU setups, please modify the [stage configuration](../../../configuration/stage_configs.md) to distribute the model across devices.
+**Note**: These examples work with the default configuration on an **NVIDIA A100 (80GB)**. We also tested on dual **NVIDIA RTX 5000 Ada (32GB each)**. For dual-GPU setups, please modify the stage configuration to distribute the model across devices.
 
 ### Launch the Server
 
@@ -32,7 +32,7 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --stage-configs-path /
 
 ### Send Multi-modal Request
 
-Get into the example folder:
+Get into the bagel folder:
 
 ```bash
 cd examples/online_serving/bagel
@@ -56,6 +56,19 @@ The Python client supports the following command-line arguments:
 - `--steps`: Number of inference steps (default: 25)
 - `--seed`: Random seed (default: 42)
 - `--negative`: Negative prompt for image generation
+
+Example with custom parameters:
+
+```bash
+python openai_chat_client.py \
+    --prompt "A futuristic city" \
+    --modality text2img \
+    --height 768 \
+    --width 768 \
+    --steps 50 \
+    --seed 42 \
+    --negative "blurry, low quality"
+```
 
 ## Modality Control
 
@@ -196,34 +209,9 @@ python openai_chat_client.py \
 curl http://localhost:8091/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"}]}],
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n"}]}]
     "modalities": ["text"]
   }'
-```
-
-## Generation Parameters
-
-You can customize image generation with these parameters:
-
-| Parameter             | Description                          | Default |
-| --------------------- | ------------------------------------ | ------- |
-| `height`              | Image height in pixels               | 512     |
-| `width`               | Image width in pixels                | 512     |
-| `num_inference_steps` | Number of diffusion steps            | 25      |
-| `seed`                | Random seed for reproducibility      | None    |
-| `negative_prompt`     | Negative prompt for image generation | None    |
-
-Example with custom parameters:
-
-```bash
-python openai_chat_client.py \
-    --prompt "A futuristic city" \
-    --modality text2img \
-    --height 768 \
-    --width 768 \
-    --steps 50 \
-    --seed 42 \
-    --negative "blurry, low quality"
 ```
 
 ## FAQ
