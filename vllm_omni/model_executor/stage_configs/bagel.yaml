@@ -59,6 +59,7 @@ stage_args:
     is_comprehension: false
     default_sampling_params:
       seed: 52
+      guidance_scale: 1.0  # CFG scale, set >1.0 to enable Classifier-Free Guidance
 
 # Runtime edges
 runtime:

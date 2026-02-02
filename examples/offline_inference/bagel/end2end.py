@@ -45,6 +45,8 @@ def parse_args():
     parser.add_argument("--ray-address", type=str, default=None)
     parser.add_argument("--stage-configs-path", type=str, default=None)
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
+    parser.add_argument("--guidance-scale", type=float, default=1.0, help="CFG guidance scale. Set >1.0 to enable CFG.")
+    parser.add_argument("--negative-prompt", type=str, default="", help="Negative prompt for CFG.")
 
     args = parser.parse_args()
     return args
@@ -89,6 +91,7 @@ def main():
                 prompts = [
                     {
                         "prompt": cast(str, p),
+                        "negative_prompt": args.negative_prompt,
                         "multi_modal_data": {"image": loaded_image},
                     }
                     for p in prompts
@@ -102,6 +105,7 @@ def main():
                 seed=52,
                 need_kv_receive=False,
                 num_inference_steps=args.steps,
+                guidance_scale=args.guidance_scale,
             ),
         )
 

@@ -1076,12 +1076,14 @@ class Bagel(torch.nn.Module):
         packed_key_value_indexes: torch.LongTensor,
         num_timesteps: int = 24,
         timestep_shift: float = 1.0,
+        guidance_scale: float = 1.0,  # [CFG] Added parameter
     ):
         model_pred_cache_dic, model_pred_current = None, None
         model_pred_text_cache_dic, model_pred_text_current = None, None
         model_pred_img_cache_dic, model_pred_img_current = None, None
 
         x_t = packed_init_noises
+        do_cfg = guidance_scale > 1.0  # [CFG] Check if CFG is enabled
 
         timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
@@ -1112,9 +1114,24 @@ class Bagel(torch.nn.Module):
                 model_pred_img_current=model_pred_img_current,
             )
 
+            # [CFG] Apply Classifier-Free Guidance formula
+            if do_cfg:
+                # v_t is packed tensor [Cond_tokens + Uncond_tokens, Hidden]
+                # Split in half since Cond and Uncond have equal token counts
+                v_cond, v_uncond = v_t.chunk(2, dim=0)
+                # CFG formula: pred = uncond + scale * (cond - uncond)
+                v_pred = v_uncond + guidance_scale * (v_cond - v_uncond)
+                # Reconstruct full batch to maintain consistency for next iteration
+                v_t = torch.cat([v_pred, v_pred], dim=0)
+
             x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
+
+        # [CFG] Return only the Conditional branch result (first half)
+        if do_cfg:
+            unpacked_latent = unpacked_latent[: len(unpacked_latent) // 2]
+
         return unpacked_latent
 
     def _forward_flow(
