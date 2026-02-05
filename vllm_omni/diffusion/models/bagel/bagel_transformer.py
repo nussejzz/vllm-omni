@@ -1259,6 +1259,12 @@ class Bagel(torch.nn.Module):
             cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
 
             # CFG formula: v_t_text = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+            # Debugging CFG
+            if torch.rand(1).item() < 0.1: # Sample 10%
+                print(f"[Debug] Main v_t norm: {torch.norm(v_t).item():.2f}, CFG v_t norm: {torch.norm(cfg_text_v_t).item():.2f}")
+                print(f"[Debug] Main rope start: {packed_position_ids[0].item()}, CFG rope start: {cfg_text_packed_position_ids[0].item()}")
+                print(f"[Debug] Main Cache Size: {sum(key_values_lens).item()}, CFG Cache Size: {sum(cfg_text_key_values_lens).item()}")
+            
             v_t_text = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
 
             # CFG Renormalization (global)
