@@ -168,14 +168,25 @@ def main():
             else:
                 # text2img
                 final_prompt_text = f"<|im_start|>{p}<|im_end|>"
-                prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
+                prompt_dict = {
+                    "prompt": final_prompt_text,
+                    "modalities": ["image"],
+                    "negative_prompt": args.negative_prompt,
+                    "guidance_scale": args.guidance_scale,
+                }
                 formatted_prompts.append(prompt_dict)
 
         params_list = omni.default_sampling_params_list
         if args.modality == "text2img":
             params_list[0].max_tokens = 1  # type: ignore # The first stage is a SamplingParam (vllm)
             if len(params_list) > 1:
-                params_list[1].num_inference_steps = args.steps  # type: ignore # The second stage is an OmniDiffusionSamplingParam
+                params_list[1].num_inference_steps = args.steps  # type: ignore
+                # Pass CFG scale to OmniDiffusionSamplingParams (stage 1)
+                if getattr(params_list[1], "guidance_scale", None) is not None:
+                    params_list[1].guidance_scale = args.guidance_scale
+                    # Mark as provided to ensure pipeline respects it
+                    if hasattr(params_list[1], "guidance_scale_provided"):
+                        params_list[1].guidance_scale_provided = True
 
         omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
 
