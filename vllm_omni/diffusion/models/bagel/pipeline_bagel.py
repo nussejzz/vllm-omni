@@ -478,11 +478,33 @@ class BagelPipeline(nn.Module):
             gen_context["ropes"] = new_rope
 
             if cfg_text_context is not None:
-                # [CFG] Sync Position IDs (ropes)
-                # Even though CFG branch skipped text prefill, we usually want VAE tokens
-                # to have aligned Position IDs with the main branch for correct RoPE subtraction.
-                # Official Bagel implementation seems to align positions implicitly or explicitly.
-                # Assuming alignment is required:
+                # [CFG] 1. Prefill Negative Prompt (Empty or User provided)
+                # This ensures the CFG branch also has the proper Text/Turn structure in cache,
+                # preventing "Image Only" context which might confuse the model.
+                cfg_gen_input, cfg_newlens, _ = self.bagel.prepare_prompts(
+                    curr_kvlens=cfg_text_context["kv_lens"],
+                    curr_rope=cfg_text_context["ropes"],
+                    prompts=[negative_prompt],
+                    tokenizer=self.tokenizer,
+                    new_token_ids=self.new_token_ids,
+                )
+                for k, v in cfg_gen_input.items():
+                    if torch.is_tensor(v):
+                        cfg_gen_input[k] = v.to(self.device)
+                
+                with torch.autocast(
+                    device_type=self.device.type,
+                    enabled=self.device.type != "cpu",
+                    dtype=self.od_config.dtype,
+                ):
+                    cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                        cfg_text_context["past_key_values"], **cfg_gen_input
+                    )
+                cfg_text_context["kv_lens"] = cfg_newlens
+                
+                # [CFG] 2. Sync Position IDs (ropes) - Force alignment with Main Branch
+                # We align VAE start position to match the Main Branch (Positive Prompt end).
+                # This ensures RoPE embeddings for VAE tokens match between Cond and Uncond branches.
                 cfg_text_context["ropes"] = copy.deepcopy(gen_context["ropes"])
 
         if req.sampling_params.seed is not None:
