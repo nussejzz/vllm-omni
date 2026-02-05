@@ -528,11 +528,11 @@ class BagelPipeline(nn.Module):
         # [CFG] Prepare cfg_text latent query if CFG is enabled
         cfg_text_generation_input = None
         if do_cfg and cfg_text_context is not None:
-            cfg_text_generation_input = self.bagel.prepare_vae_latent(
+            # Use prepare_vae_latent_cfg which only returns indices (no noise/text_ids)
+            cfg_text_generation_input = self.bagel.prepare_vae_latent_cfg(
                 curr_kvlens=cfg_text_context["kv_lens"],
                 curr_rope=cfg_text_context["ropes"],
                 image_sizes=[image_shape],
-                new_token_ids=self.new_token_ids,
             )
             for k, v in cfg_text_generation_input.items():
                 if torch.is_tensor(v):
@@ -549,10 +549,10 @@ class BagelPipeline(nn.Module):
                 cfg_kwargs = {
                     "cfg_text_scale": gen_params.cfg_text_scale,
                     "cfg_text_past_key_values": cfg_text_context["past_key_values"],
-                    "cfg_text_key_values_lens": torch.tensor(cfg_text_context["kv_lens"], dtype=torch.int).to(self.device),
-                    "cfg_text_packed_position_ids": cfg_text_generation_input["packed_position_ids"],
-                    "cfg_text_packed_query_indexes": cfg_text_generation_input["packed_indexes"],
-                    "cfg_text_packed_key_value_indexes": cfg_text_generation_input["packed_key_value_indexes"],
+                    "cfg_text_key_values_lens": cfg_text_generation_input["cfg_key_values_lens"],
+                    "cfg_text_packed_position_ids": cfg_text_generation_input["cfg_packed_position_ids"],
+                    "cfg_text_packed_query_indexes": cfg_text_generation_input["cfg_packed_query_indexes"],
+                    "cfg_text_packed_key_value_indexes": cfg_text_generation_input["cfg_packed_key_value_indexes"],
                     "cfg_interval": gen_params.cfg_interval,
                     "cfg_renorm_min": gen_params.cfg_renorm_min,
                 }

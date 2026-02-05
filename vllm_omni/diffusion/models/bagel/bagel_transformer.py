@@ -1061,6 +1061,40 @@ class Bagel(torch.nn.Module):
     def prepare_vae_latent(self, curr_kvlens, curr_rope, image_sizes, new_token_ids):
         return self.prepare_input(curr_kvlens, curr_rope, image_sizes, new_token_ids)
 
+    def prepare_vae_latent_cfg(self, curr_kvlens, curr_rope, image_sizes):
+        """Prepare VAE latent inputs for CFG branches (only indices, no noise/text_ids)."""
+        packed_position_ids, packed_indexes, packed_key_value_indexes = list(), list(), list()
+
+        query_curr = curr = 0
+        for (H, W), curr_kvlen, curr_position_id in zip(image_sizes, curr_kvlens, curr_rope):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            curr += curr_kvlen
+
+            packed_indexes.append(curr)
+            curr += 1
+            query_curr += 1
+
+            h, w = H // self.latent_downsample, W // self.latent_downsample
+            num_image_tokens = h * w
+            packed_indexes.extend(range(curr, curr + num_image_tokens))
+            curr += num_image_tokens
+            query_curr += num_image_tokens
+
+            packed_indexes.append(curr)
+            curr += 1
+            query_curr += 1
+
+            packed_position_ids.extend([curr_position_id] * (num_image_tokens + 2))
+
+        generation_input = {
+            "cfg_packed_position_ids": torch.tensor(packed_position_ids, dtype=torch.long),
+            "cfg_key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "cfg_packed_query_indexes": torch.tensor(packed_indexes, dtype=torch.long),
+            "cfg_packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+        }
+
+        return generation_input
+
     def generate_image(
         self,
         packed_text_ids: torch.LongTensor,
