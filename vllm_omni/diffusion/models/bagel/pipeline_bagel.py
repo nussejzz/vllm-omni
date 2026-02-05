@@ -291,12 +291,19 @@ class BagelPipeline(nn.Module):
         guidance_scale = 4.0  # Default for img2img (matching official Bagel)
         if not isinstance(first_prompt, str):
             negative_prompt = first_prompt.get("negative_prompt", "") or ""
-            # Prompt dict takes priority
+            # Prompt dict takes priority initially
             if "guidance_scale" in first_prompt and first_prompt["guidance_scale"] is not None:
                 guidance_scale = float(first_prompt["guidance_scale"])
-        # sampling_params.guidance_scale overrides only if explicitly set (>0)
-        if hasattr(req.sampling_params, "guidance_scale") and req.sampling_params.guidance_scale > 0:
-            guidance_scale = float(req.sampling_params.guidance_scale)
+
+        # Check sampling_params override
+        # We must use guidance_scale_provided flag because request.py defaults guidance_scale to 1.0
+        sp = req.sampling_params
+        if hasattr(sp, "guidance_scale_provided") and sp.guidance_scale_provided:
+             if sp.guidance_scale is not None:
+                guidance_scale = float(sp.guidance_scale)
+        elif hasattr(sp, "guidance_scale") and sp.guidance_scale is not None and sp.guidance_scale != 1.0 and sp.guidance_scale > 0:
+             # Fallback: if provided flag is missing but value is not default 1.0/0.0
+             guidance_scale = float(sp.guidance_scale)
 
         do_cfg = guidance_scale > 1.0
         logger.info(f"[CFG] guidance_scale={guidance_scale}, do_cfg={do_cfg}, negative_prompt='{negative_prompt[:50]}...' if negative_prompt else ''")

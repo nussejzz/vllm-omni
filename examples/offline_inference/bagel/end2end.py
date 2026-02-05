@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument(
         "--guidance-scale",
         type=float,
-        default=1.0,
+        default=4.0,  # Official Bagel img2img default
         help="Classifier-Free Guidance scale. >1.0 enables CFG (recommended: 3.0-7.0).",
     )
     parser.add_argument(
@@ -118,6 +118,7 @@ def main():
                 seed=52,
                 need_kv_receive=False,
                 num_inference_steps=args.steps,
+                guidance_scale=args.guidance_scale,
             ),
         )
 
