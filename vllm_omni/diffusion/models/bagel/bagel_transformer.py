@@ -9,7 +9,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
