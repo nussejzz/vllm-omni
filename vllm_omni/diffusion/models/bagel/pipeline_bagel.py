@@ -156,8 +156,8 @@ def _patchify_bagel_latents(latents, patch_size=2):
     p = patch_size
     # reshape to (n, c, h//p, p, w//p, p)
     x = latents.reshape(n, c, h // p, p, w // p, p)
-    # permute to (n, h//p, w//p, c, p, p) matching bagel_transformer patchify
-    x = torch.einsum("nchpwq->nhwcpq", x)
+    # permute to (n, h//p, w//p, p, p, c) matching decode logic (Channel Last)
+    x = torch.einsum("nchpwq->nhwpqc", x)
     # flatten
     x = x.reshape(n, -1, c * p * p)
     return x.squeeze(0) if n == 1 else x
