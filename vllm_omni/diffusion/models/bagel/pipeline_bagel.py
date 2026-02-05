@@ -477,6 +477,14 @@ class BagelPipeline(nn.Module):
             gen_context["kv_lens"] = newlens
             gen_context["ropes"] = new_rope
 
+            if cfg_text_context is not None:
+                # [CFG] Sync Position IDs (ropes)
+                # Even though CFG branch skipped text prefill, we usually want VAE tokens
+                # to have aligned Position IDs with the main branch for correct RoPE subtraction.
+                # Official Bagel implementation seems to align positions implicitly or explicitly.
+                # Assuming alignment is required:
+                cfg_text_context["ropes"] = copy.deepcopy(gen_context["ropes"])
+
         if req.sampling_params.seed is not None:
             torch.manual_seed(req.sampling_params.seed)
             if self.device.type == "cuda":
