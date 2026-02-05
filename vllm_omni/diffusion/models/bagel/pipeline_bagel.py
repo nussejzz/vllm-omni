@@ -288,15 +288,18 @@ class BagelPipeline(nn.Module):
 
         # [CFG] Extract CFG parameters from request
         negative_prompt = ""
-        guidance_scale = 1.0
+        guidance_scale = 4.0  # Default for img2img (matching official Bagel)
         if not isinstance(first_prompt, str):
             negative_prompt = first_prompt.get("negative_prompt", "") or ""
-            guidance_scale = float(first_prompt.get("guidance_scale", 1.0) or 1.0)
-        # Also check sampling_params for guidance_scale (command line override)
-        if hasattr(req.sampling_params, "guidance_scale") and req.sampling_params.guidance_scale is not None:
+            # Prompt dict takes priority
+            if "guidance_scale" in first_prompt and first_prompt["guidance_scale"] is not None:
+                guidance_scale = float(first_prompt["guidance_scale"])
+        # sampling_params.guidance_scale overrides only if explicitly set (>0)
+        if hasattr(req.sampling_params, "guidance_scale") and req.sampling_params.guidance_scale > 0:
             guidance_scale = float(req.sampling_params.guidance_scale)
 
         do_cfg = guidance_scale > 1.0
+        logger.info(f"[CFG] guidance_scale={guidance_scale}, do_cfg={do_cfg}, negative_prompt='{negative_prompt[:50]}...' if negative_prompt else ''")
 
         max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
         if req.sampling_params.height is None and req.sampling_params.width is None:
