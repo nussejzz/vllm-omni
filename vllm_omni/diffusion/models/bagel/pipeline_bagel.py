@@ -326,12 +326,32 @@ class BagelPipeline(nn.Module):
         do_cfg = guidance_scale > 1.0
         logger.info(f"[CFG] guidance_scale={guidance_scale}, do_cfg={do_cfg}, negative_prompt='{negative_prompt[:50]}...' if negative_prompt else ''")
 
+        # [Omni] Determine input image size if available
+        image_input_chk = (
+            None if isinstance(first_prompt, str) else (first_prompt.get("multi_modal_data") or {}).get("image")
+        )
+        default_h, default_w = None, None
+        if image_input_chk:
+            if not isinstance(image_input_chk, list):
+                image_input_chk = [image_input_chk]
+            if len(image_input_chk) > 0:
+                img_chk = image_input_chk[0]
+                if isinstance(img_chk, str) and os.path.exists(img_chk):
+                    img_chk = Image.open(img_chk)
+                
+                if hasattr(img_chk, "height"):
+                    default_h, default_w = img_chk.height, img_chk.width
+
         max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
+        if default_h is None:
+            default_h = default_w = max_hw
+
         if req.sampling_params.height is None and req.sampling_params.width is None:
-            height = width = max_hw
+            height = default_h
+            width = default_w
         else:
-            height = int(req.sampling_params.height) if req.sampling_params.height is not None else max_hw
-            width = int(req.sampling_params.width) if req.sampling_params.width is not None else max_hw
+            height = int(req.sampling_params.height) if req.sampling_params.height is not None else default_h
+            width = int(req.sampling_params.width) if req.sampling_params.width is not None else default_w
         if height > max_hw or width > max_hw:
             raise ValueError(
                 f"Requested resolution {height}x{width} exceeds Bagel checkpoint limit "
