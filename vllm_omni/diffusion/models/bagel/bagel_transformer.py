@@ -1131,6 +1131,9 @@ class Bagel(torch.nn.Module):
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
 
+        print(f"[Debug] Starting generation with {len(timesteps)} timesteps, timestep_shift={timestep_shift}")
+        print(f"[Debug] Initial x_t: shape={x_t.shape}, mean={x_t.mean().item():.4f}, std={x_t.std().item():.4f}, norm={torch.norm(x_t).item():.2f}")
+        
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
 
@@ -1139,6 +1142,10 @@ class Bagel(torch.nn.Module):
                 cfg_text_scale_ = cfg_text_scale
             else:
                 cfg_text_scale_ = 1.0
+
+            # Debug: Print at first, middle, and last steps
+            if i == 0 or i == len(timesteps) - 1 or i == len(timesteps) // 2:
+                print(f"[Debug] Step {i}/{len(timesteps)}: t={t:.4f}, cfg_scale={cfg_text_scale_:.2f}, x_t norm={torch.norm(x_t).item():.2f}")
 
             v_t = self._forward_flow(
                 x_t=x_t,
@@ -1172,6 +1179,9 @@ class Bagel(torch.nn.Module):
 
             x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
 
+        print(f"[Debug] Final x_t: mean={x_t.mean().item():.4f}, std={x_t.std().item():.4f}, norm={torch.norm(x_t).item():.2f}")
+        print(f"[Debug] Final x_t min={x_t.min().item():.4f}, max={x_t.max().item():.4f}")
+        
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
 
