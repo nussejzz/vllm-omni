@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 @dataclass
 class BagelGenParams:
     num_timesteps: int = 50
-    timestep_shift: float = 1.0  # Testing linear schedule (was 3.0)
+    timestep_shift: float = 3.0  # Official Bagel default
     # CFG parameters (official defaults for img2img)
     cfg_text_scale: float = 4.0  # Text CFG scale (official default: 4.0)
     cfg_interval: tuple[float, float] = (0.0, 1.0)  # Apply CFG in this timestep range

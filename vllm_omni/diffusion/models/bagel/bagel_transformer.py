@@ -1135,9 +1135,7 @@ class Bagel(torch.nn.Module):
         print(f"[Debug] Initial x_t: shape={x_t.shape}, mean={x_t.mean().item():.4f}, std={x_t.std().item():.4f}, norm={torch.norm(x_t).item():.2f}")
         
         for i, t in enumerate(timesteps):
-            # Scale timestep by 1000 for Embedding to match Bagel/Qwen2 expectations
-            t_scaled = t * 1000.0
-            timestep = torch.tensor([t_scaled] * x_t.shape[0], device=x_t.device)
+            timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
 
             # [CFG] Dynamic CFG scale based on cfg_interval
             if t > cfg_interval[0] and t <= cfg_interval[1]:
@@ -1147,7 +1145,7 @@ class Bagel(torch.nn.Module):
 
             # Debug: Print at first, middle, and last steps
             if i == 0 or i == len(timesteps) - 1 or i == len(timesteps) // 2:
-                print(f"[Debug] Step {i}/{len(timesteps)}: t={t:.4f} (scaled={t_scaled.item():.1f}), cfg_scale={cfg_text_scale_:.2f}, x_t norm={torch.norm(x_t).item():.2f}")
+                print(f"[Debug] Step {i}/{len(timesteps)}: t={t:.4f}, cfg_scale={cfg_text_scale_:.2f}, x_t norm={torch.norm(x_t).item():.2f}")
 
             v_t = self._forward_flow(
                 x_t=x_t,
