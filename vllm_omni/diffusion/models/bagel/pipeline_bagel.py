@@ -148,7 +148,25 @@ class SiglipNaViTWrapper(nn.Module):
         return outputs.last_hidden_state.squeeze(0)
 
 
+
+def _patchify_bagel_latents(latents, patch_size=2):
+    # latents: (N, C, H, W)
+    # Output: (N, L, C*p*p)
+    n, c, h, w = latents.shape
+    p = patch_size
+    # reshape to (n, c, h//p, p, w//p, p)
+    x = latents.reshape(n, c, h // p, p, w // p, p)
+    # permute to (n, h//p, w//p, c, p, p) matching bagel_transformer patchify
+    x = torch.einsum("nchpwq->nhwcpq", x)
+    # flatten
+    x = x.reshape(n, -1, c * p * p)
+    return x.squeeze(0) if n == 1 else x
+
 class BagelPipeline(nn.Module):
+# ... (existing class def, skipping to forward method modifications) ...
+# I cannot redefine the class. I must target specific blocks. 
+# I will use multiple chunks.
+
     """Bagel generation pipeline (MoT) packaged for vllm-omni diffusion engine.
 
     This pipeline is self-contained and uses the ported Bagel core files.
@@ -336,6 +354,7 @@ class BagelPipeline(nn.Module):
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
+        latent_init_tensor = None
 
         # Add text prompt (prefill) on gen context.
         # [Omni] Check for injected KV Cache from remote transfer
@@ -373,6 +392,14 @@ class BagelPipeline(nn.Module):
                         # Convert to [-1, 1] tensor (H, W, C) -> (C, H, W)
                         arr = torch.from_numpy(np.array(img)).float() / 127.5 - 1.0
                         return arr.permute(2, 0, 1)
+
+                    # Capture for Img2Img Init
+                    if latent_init_tensor is None and len(image_input) > 0:
+                        try:
+                            with torch.no_grad():
+                                latent_init_tensor = vae_transforms(image_input[0]).unsqueeze(0).to(self.device, dtype=self.od_config.dtype)
+                        except Exception as e:
+                            logger.warning(f"Failed to capture latent_init_tensor: {e}")
 
                     # 1. Update VAE
                     gen_input_vae, newlens_vae, new_rope_vae = self.bagel.prepare_vae_images(
@@ -545,6 +572,39 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
+        # [Omni] Img2Img Init Logic
+        init_timesteps = None
+        if latent_init_tensor is not None:
+             try:
+                 # 1. Encode
+                 with torch.no_grad():
+                     with torch.autocast(device_type=self.device.type, dtype=self.od_config.dtype):
+                        init_z = self.vae.encode(latent_init_tensor)
+                 
+                 # 2. Patchify
+                 z_flat = _patchify_bagel_latents(init_z, patch_size=self.bagel.config.latent_patch_size)
+                 
+                 # 3. Calculate Timesteps
+                 strength = 0.75
+                 full_timesteps = torch.linspace(1, 0, gen_params.num_timesteps, device=self.device, dtype=self.od_config.dtype)
+                 ts = gen_params.timestep_shift
+                 shifted_timesteps = ts * full_timesteps / (1 + (ts - 1) * full_timesteps)
+                 
+                 # Find start index
+                 start_idx = (full_timesteps - strength).abs().argmin()
+                 
+                 init_timesteps = shifted_timesteps[start_idx:]
+                 t_start = full_timesteps[start_idx] 
+                 
+                 noise = torch.randn_like(z_flat)
+                 z_noisy = t_start * noise + (1 - t_start) * z_flat
+                 
+                 generation_input["packed_init_noises"] = z_noisy
+                 logger.info(f"[Img2Img] Initialized from image. Strength={strength}, StartIdx={start_idx}, LinearT={t_start:.4f}")
+                 
+             except Exception as e:
+                 logger.error(f"[Img2Img] Initialization failed: {e}")
+
         # [CFG] Prepare cfg_text latent query if CFG is enabled
         cfg_text_generation_input = None
         if do_cfg and cfg_text_context is not None:
@@ -581,6 +641,7 @@ class BagelPipeline(nn.Module):
                 past_key_values=gen_context["past_key_values"],
                 num_timesteps=gen_params.num_timesteps,
                 timestep_shift=gen_params.timestep_shift,
+                timesteps=init_timesteps,
                 **generation_input,
                 **cfg_kwargs,
             )

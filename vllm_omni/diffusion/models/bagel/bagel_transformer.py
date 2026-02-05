@@ -1108,26 +1108,50 @@ class Bagel(torch.nn.Module):
         past_key_values: NaiveCache,
         key_values_lens: torch.IntTensor,
         packed_key_value_indexes: torch.LongTensor,
-        num_timesteps: int = 24,
+        num_timesteps: int = 24, # Kept for cache_init, as it's not in the provided signature snippet
         timestep_shift: float = 1.0,
+        timesteps: Optional[torch.Tensor] = None,
+        cfg_renorm_min: float = 0.0,
+        cfg_renorm_type: str = "global",
+        cfg_interval: Optional[Tuple[float, float]] = [0, 1],
         # CFG parameters
+        # cfg_text
         cfg_text_scale: float = 1.0,
         cfg_text_past_key_values: NaiveCache | None = None,
         cfg_text_key_values_lens: torch.IntTensor | None = None,
         cfg_text_packed_position_ids: torch.LongTensor | None = None,
         cfg_text_packed_query_indexes: torch.LongTensor | None = None,
         cfg_text_packed_key_value_indexes: torch.LongTensor | None = None,
-        cfg_interval: tuple[float, float] = (0.0, 1.0),
-        cfg_renorm_min: float = 0.0,
+        # cfg_img
+        cfg_img_scale: float = 1.0,
+        cfg_img_packed_query_indexes: Optional[torch.LongTensor] = None,
+        cfg_img_packed_position_ids: Optional[torch.LongTensor] = None,
+        cfg_img_past_key_values: Optional[NaiveCache] = None,
+        cfg_img_key_values_lens: Optional[torch.IntTensor] = None,
+        cfg_img_packed_key_value_indexes: Optional[torch.LongTensor] = None,
+        cfg_type: str = "parallel",
+        # cache_args
+        enable_taylorseer=False,
     ):
-        model_pred_cache_dic, model_pred_current = None, None
-        model_pred_text_cache_dic, model_pred_text_current = None, None
-        model_pred_img_cache_dic, model_pred_img_current = None, None
-
+        if enable_taylorseer:
+            self.language_model.model.enable_taylorseer = True
+            model_pred_cache_dic, model_pred_current = cache_init(self, num_timesteps)
+            model_pred_text_cache_dic, model_pred_text_current = cache_init(self, num_timesteps)
+            model_pred_img_cache_dic, model_pred_img_current = cache_init(self, num_timesteps)
+        else:
+            self.language_model.model.enable_taylorseer = False
+            model_pred_cache_dic, model_pred_current = None, None
+            model_pred_text_cache_dic, model_pred_text_current = None, None
+            model_pred_img_cache_dic, model_pred_img_current = None, None
+    
         x_t = packed_init_noises
 
-        timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
-        timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
+        if timesteps is None:
+            timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
+            timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
+        else:
+            timesteps = timesteps.to(x_t.device)
+
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
 
