@@ -1076,6 +1076,15 @@ class Bagel(torch.nn.Module):
         packed_key_value_indexes: torch.LongTensor,
         num_timesteps: int = 24,
         timestep_shift: float = 1.0,
+        # CFG parameters
+        cfg_text_scale: float = 1.0,
+        cfg_text_past_key_values: NaiveCache | None = None,
+        cfg_text_key_values_lens: torch.IntTensor | None = None,
+        cfg_text_packed_position_ids: torch.LongTensor | None = None,
+        cfg_text_packed_query_indexes: torch.LongTensor | None = None,
+        cfg_text_packed_key_value_indexes: torch.LongTensor | None = None,
+        cfg_interval: tuple[float, float] = (0.0, 1.0),
+        cfg_renorm_min: float = 0.0,
     ):
         model_pred_cache_dic, model_pred_current = None, None
         model_pred_text_cache_dic, model_pred_text_current = None, None
@@ -1090,6 +1099,13 @@ class Bagel(torch.nn.Module):
 
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+
+            # [CFG] Dynamic CFG scale based on cfg_interval
+            if t > cfg_interval[0] and t <= cfg_interval[1]:
+                cfg_text_scale_ = cfg_text_scale
+            else:
+                cfg_text_scale_ = 1.0
+
             v_t = self._forward_flow(
                 x_t=x_t,
                 timestep=timestep,
@@ -1103,6 +1119,14 @@ class Bagel(torch.nn.Module):
                 key_values_lens=key_values_lens,
                 past_key_values=past_key_values,
                 packed_key_value_indexes=packed_key_value_indexes,
+                # CFG text parameters
+                cfg_text_scale=cfg_text_scale_,
+                cfg_text_past_key_values=cfg_text_past_key_values,
+                cfg_text_key_values_lens=cfg_text_key_values_lens,
+                cfg_text_packed_position_ids=cfg_text_packed_position_ids,
+                cfg_text_packed_query_indexes=cfg_text_packed_query_indexes,
+                cfg_text_packed_key_value_indexes=cfg_text_packed_key_value_indexes,
+                cfg_renorm_min=cfg_renorm_min,
                 # cache
                 model_pred_cache_dic=model_pred_cache_dic,
                 model_pred_current=model_pred_current,
@@ -1131,6 +1155,14 @@ class Bagel(torch.nn.Module):
         key_values_lens: torch.IntTensor,
         past_key_values: NaiveCache,
         packed_key_value_indexes: torch.LongTensor,
+        # CFG text parameters
+        cfg_text_scale: float = 1.0,
+        cfg_text_past_key_values: NaiveCache | None = None,
+        cfg_text_key_values_lens: torch.IntTensor | None = None,
+        cfg_text_packed_position_ids: torch.LongTensor | None = None,
+        cfg_text_packed_query_indexes: torch.LongTensor | None = None,
+        cfg_text_packed_key_value_indexes: torch.LongTensor | None = None,
+        cfg_renorm_min: float = 0.0,
         # cache
         model_pred_cache_dic: dict[str, Any] | None = None,
         model_pred_current: int | None = None,
@@ -1146,10 +1178,10 @@ class Bagel(torch.nn.Module):
         assert timestep.unique().shape[0] == 1
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.time_embedder(timestep)
-        x_t = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
-        if x_t.dtype != packed_sequence.dtype:
-            x_t = x_t.to(packed_sequence.dtype)
-        packed_sequence[packed_vae_token_indexes] = x_t
+        x_t_embedded = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
+        if x_t_embedded.dtype != packed_sequence.dtype:
+            x_t_embedded = x_t_embedded.to(packed_sequence.dtype)
+        packed_sequence[packed_vae_token_indexes] = x_t_embedded
 
         extra_inputs = {}
         if self.use_moe:
@@ -1173,5 +1205,32 @@ class Bagel(torch.nn.Module):
         )
         v_t = self.llm2vae(output.packed_query_sequence)
         v_t = v_t[packed_vae_token_indexes]
+
+        # [CFG] Apply Classifier-Free Guidance if cfg_text_scale > 1.0
+        if cfg_text_scale > 1.0 and cfg_text_past_key_values is not None:
+            # Forward pass with cfg_text context (unconditioned on positive text)
+            cfg_text_output = self.language_model.forward(
+                packed_query_sequence=packed_sequence,
+                query_lens=packed_seqlens,
+                packed_query_position_ids=cfg_text_packed_position_ids,
+                packed_query_indexes=cfg_text_packed_query_indexes,
+                past_key_values=cfg_text_past_key_values,
+                key_values_lens=cfg_text_key_values_lens,
+                packed_key_value_indexes=cfg_text_packed_key_value_indexes,
+                update_past_key_values=False,
+                is_causal=False,
+                **extra_inputs,
+            )
+            cfg_text_v_t = self.llm2vae(cfg_text_output.packed_query_sequence)
+            cfg_text_v_t = cfg_text_v_t[packed_vae_token_indexes]
+
+            # CFG formula: v_t_text = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+            v_t_text = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+
+            # CFG Renormalization (global)
+            norm_v_t = torch.norm(v_t)
+            norm_v_t_text = torch.norm(v_t_text)
+            scale = (norm_v_t / (norm_v_t_text + 1e-8)).clamp(min=cfg_renorm_min, max=1.0)
+            v_t = v_t_text * scale
 
         return v_t

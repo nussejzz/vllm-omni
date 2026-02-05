@@ -46,6 +46,20 @@ def parse_args():
     parser.add_argument("--stage-configs-path", type=str, default=None)
     parser.add_argument("--steps", type=int, default=50, help="Number of inference steps.")
 
+    # CFG parameters
+    parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=1.0,
+        help="Classifier-Free Guidance scale. >1.0 enables CFG (recommended: 3.0-7.0).",
+    )
+    parser.add_argument(
+        "--negative-prompt",
+        type=str,
+        default="",
+        help="Negative prompt for CFG (what to avoid in generation).",
+    )
+
     args = parser.parse_args()
     return args
 
@@ -89,6 +103,8 @@ def main():
                 prompts = [
                     {
                         "prompt": cast(str, p),
+                        "negative_prompt": args.negative_prompt,
+                        "guidance_scale": args.guidance_scale,
                         "multi_modal_data": {"image": loaded_image},
                     }
                     for p in prompts

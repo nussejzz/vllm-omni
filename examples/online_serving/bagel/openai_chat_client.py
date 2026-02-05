@@ -23,6 +23,7 @@ def generate_image(
     steps: int | None = None,
     seed: int | None = None,
     negative_prompt: str | None = None,
+    guidance_scale: float | None = None,
     modality: str = "text2img",  # "text2img" (default), "img2img", "img2text", "text2text"
 ) -> bytes | str | None:
     """Generate an image or text using the chat completions API.
@@ -36,6 +37,7 @@ def generate_image(
         steps: Number of inference steps
         seed: Random seed
         negative_prompt: Negative prompt
+        guidance_scale: CFG scale (>1.0 enables CFG, recommended 3.0-7.0)
         modality: Task modality hint
 
     Returns:
@@ -79,6 +81,8 @@ def generate_image(
         payload["seed"] = seed
     if negative_prompt:
         payload["negative_prompt"] = negative_prompt
+    if guidance_scale is not None:
+        payload["guidance_scale"] = guidance_scale
 
     # Send request
     try:
@@ -145,6 +149,7 @@ def main():
     parser.add_argument("--steps", type=int, default=25, help="Inference steps")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--negative", help="Negative prompt")
+    parser.add_argument("--guidance-scale", type=float, default=1.0, help="CFG scale (>1.0 enables CFG)")
 
     args = parser.parse_args()
 
@@ -161,6 +166,7 @@ def main():
         steps=args.steps,
         seed=args.seed,
         negative_prompt=args.negative,
+        guidance_scale=args.guidance_scale,
         modality=args.modality,
     )
 

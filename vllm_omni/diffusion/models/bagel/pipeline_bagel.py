@@ -38,6 +38,10 @@ logger = init_logger(__name__)
 class BagelGenParams:
     num_timesteps: int = 50
     timestep_shift: float = 1.0
+    # CFG parameters
+    cfg_text_scale: float = 1.0  # Text CFG scale, >1.0 enables Text CFG
+    cfg_interval: tuple[float, float] = (0.0, 1.0)  # Apply CFG in this timestep range
+    cfg_renorm_min: float = 0.0  # Minimum renorm scale (0.0 = full renorm)
 
 
 def add_special_tokens(tokenizer):
@@ -282,6 +286,18 @@ class BagelPipeline(nn.Module):
         first_prompt = req.prompts[0]
         prompt = first_prompt if isinstance(req.prompts[0], str) else (req.prompts[0].get("prompt") or "")
 
+        # [CFG] Extract CFG parameters from request
+        negative_prompt = ""
+        guidance_scale = 1.0
+        if not isinstance(first_prompt, str):
+            negative_prompt = first_prompt.get("negative_prompt", "") or ""
+            guidance_scale = float(first_prompt.get("guidance_scale", 1.0) or 1.0)
+        # Also check sampling_params for guidance_scale (command line override)
+        if hasattr(req.sampling_params, "guidance_scale") and req.sampling_params.guidance_scale is not None:
+            guidance_scale = float(req.sampling_params.guidance_scale)
+
+        do_cfg = guidance_scale > 1.0
+
         max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
         if req.sampling_params.height is None and req.sampling_params.width is None:
             height = width = max_hw
@@ -300,6 +316,9 @@ class BagelPipeline(nn.Module):
         gen_params = BagelGenParams(
             num_timesteps=int(req.sampling_params.num_inference_steps or 50),
             timestep_shift=3.0,
+            cfg_text_scale=guidance_scale,
+            cfg_interval=(0.0, 1.0),
+            cfg_renorm_min=0.0,
         )
 
         gen_context = {
@@ -393,6 +412,50 @@ class BagelPipeline(nn.Module):
                         )
                     gen_context["kv_lens"] = newlens_img
                     gen_context["ropes"] = new_rope_img
+
+            # [CFG] Create cfg_text_context (unconditioned on text, only image)
+            # This is saved BEFORE text prefill on gen_context
+            cfg_text_context = None
+            if do_cfg:
+                import copy
+                cfg_text_context = {
+                    "kv_lens": copy.deepcopy(gen_context["kv_lens"]),
+                    "ropes": copy.deepcopy(gen_context["ropes"]),
+                    "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
+                }
+                # Deep copy the KV cache
+                for layer_idx in range(self.bagel.config.llm_config.num_hidden_layers):
+                    if gen_context["past_key_values"].key_cache[layer_idx] is not None:
+                        cfg_text_context["past_key_values"].key_cache[layer_idx] = (
+                            gen_context["past_key_values"].key_cache[layer_idx].clone()
+                        )
+                        cfg_text_context["past_key_values"].value_cache[layer_idx] = (
+                            gen_context["past_key_values"].value_cache[layer_idx].clone()
+                        )
+
+                # Prefill cfg_text_context with negative_prompt (or empty string)
+                cfg_text_input, cfg_text_newlens, cfg_text_new_rope = self.bagel.prepare_prompts(
+                    curr_kvlens=cfg_text_context["kv_lens"],
+                    curr_rope=cfg_text_context["ropes"],
+                    prompts=[negative_prompt],
+                    tokenizer=self.tokenizer,
+                    new_token_ids=self.new_token_ids,
+                )
+                for k, v in cfg_text_input.items():
+                    if torch.is_tensor(v):
+                        cfg_text_input[k] = v.to(self.device)
+                with torch.autocast(
+                    device_type=self.device.type,
+                    enabled=self.device.type != "cpu",
+                    dtype=self.od_config.dtype,
+                ):
+                    cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                        cfg_text_context["past_key_values"], **cfg_text_input
+                    )
+                cfg_text_context["kv_lens"] = cfg_text_newlens
+                cfg_text_context["ropes"] = cfg_text_new_rope
+
+            # Continue with gen_context text prefill (positive prompt)
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
                 curr_kvlens=gen_context["kv_lens"],
                 curr_rope=gen_context["ropes"],
@@ -462,16 +525,44 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
 
+        # [CFG] Prepare cfg_text latent query if CFG is enabled
+        cfg_text_generation_input = None
+        if do_cfg and cfg_text_context is not None:
+            cfg_text_generation_input = self.bagel.prepare_vae_latent(
+                curr_kvlens=cfg_text_context["kv_lens"],
+                curr_rope=cfg_text_context["ropes"],
+                image_sizes=[image_shape],
+                new_token_ids=self.new_token_ids,
+            )
+            for k, v in cfg_text_generation_input.items():
+                if torch.is_tensor(v):
+                    cfg_text_generation_input[k] = v.to(self.device)
+
         with torch.autocast(
             device_type=self.device.type,
             enabled=self.device.type != "cpu",
             dtype=self.od_config.dtype,
         ):
+            # [CFG] Pass CFG parameters to generate_image
+            cfg_kwargs = {}
+            if do_cfg and cfg_text_context is not None:
+                cfg_kwargs = {
+                    "cfg_text_scale": gen_params.cfg_text_scale,
+                    "cfg_text_past_key_values": cfg_text_context["past_key_values"],
+                    "cfg_text_key_values_lens": torch.tensor(cfg_text_context["kv_lens"], dtype=torch.int).to(self.device),
+                    "cfg_text_packed_position_ids": cfg_text_generation_input["packed_position_ids"],
+                    "cfg_text_packed_query_indexes": cfg_text_generation_input["packed_indexes"],
+                    "cfg_text_packed_key_value_indexes": cfg_text_generation_input["packed_key_value_indexes"],
+                    "cfg_interval": gen_params.cfg_interval,
+                    "cfg_renorm_min": gen_params.cfg_renorm_min,
+                }
+
             latents = self.bagel.generate_image(
                 past_key_values=gen_context["past_key_values"],
                 num_timesteps=gen_params.num_timesteps,
                 timestep_shift=gen_params.timestep_shift,
                 **generation_input,
+                **cfg_kwargs,
             )
 
         # Decode first sample
