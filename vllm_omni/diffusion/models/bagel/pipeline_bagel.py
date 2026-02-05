@@ -37,9 +37,9 @@ logger = init_logger(__name__)
 @dataclass
 class BagelGenParams:
     num_timesteps: int = 50
-    timestep_shift: float = 1.0
-    # CFG parameters
-    cfg_text_scale: float = 1.0  # Text CFG scale, >1.0 enables Text CFG
+    timestep_shift: float = 3.0  # Official Bagel default
+    # CFG parameters (official defaults for img2img)
+    cfg_text_scale: float = 4.0  # Text CFG scale (official default: 4.0)
     cfg_interval: tuple[float, float] = (0.0, 1.0)  # Apply CFG in this timestep range
     cfg_renorm_min: float = 0.0  # Minimum renorm scale (0.0 = full renorm)
 
@@ -414,7 +414,8 @@ class BagelPipeline(nn.Module):
                     gen_context["ropes"] = new_rope_img
 
             # [CFG] Create cfg_text_context (unconditioned on text, only image)
-            # This is saved BEFORE text prefill on gen_context
+            # Official Bagel: cfg_text_context = deepcopy(gen_context) AFTER image prefill, BEFORE text prefill
+            # It does NOT get any text prefill - this is the "no text" branch for CFG
             cfg_text_context = None
             if do_cfg:
                 import copy
@@ -432,28 +433,7 @@ class BagelPipeline(nn.Module):
                         cfg_text_context["past_key_values"].value_cache[layer_idx] = (
                             gen_context["past_key_values"].value_cache[layer_idx].clone()
                         )
-
-                # Prefill cfg_text_context with negative_prompt (or empty string)
-                cfg_text_input, cfg_text_newlens, cfg_text_new_rope = self.bagel.prepare_prompts(
-                    curr_kvlens=cfg_text_context["kv_lens"],
-                    curr_rope=cfg_text_context["ropes"],
-                    prompts=[negative_prompt],
-                    tokenizer=self.tokenizer,
-                    new_token_ids=self.new_token_ids,
-                )
-                for k, v in cfg_text_input.items():
-                    if torch.is_tensor(v):
-                        cfg_text_input[k] = v.to(self.device)
-                with torch.autocast(
-                    device_type=self.device.type,
-                    enabled=self.device.type != "cpu",
-                    dtype=self.od_config.dtype,
-                ):
-                    cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                        cfg_text_context["past_key_values"], **cfg_text_input
-                    )
-                cfg_text_context["kv_lens"] = cfg_text_newlens
-                cfg_text_context["ropes"] = cfg_text_new_rope
+                # NOTE: cfg_text_context does NOT get text prefill - it stays "image only"
 
             # Continue with gen_context text prefill (positive prompt)
             generation_input, newlens, new_rope = self.bagel.prepare_prompts(
