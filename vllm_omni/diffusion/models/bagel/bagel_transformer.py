@@ -8,6 +8,7 @@
 # available at https://github.com/huggingface/transformers/blob/main/LICENSE.
 
 import math
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -27,12 +28,15 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.utils.fa import flash_attn_varlen_func
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
+
+logger = init_logger(__name__)
 
 
 def patchify(imgs, p):
@@ -1324,7 +1328,17 @@ class Bagel(nn.Module):
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
 
+        use_cfg_text = cfg_text_scale > 1.0
+        use_cfg_img = cfg_img_scale > 1.0
+        num_cfg_branches = 1 + int(use_cfg_text) + int(use_cfg_img)
+        logger.info(
+            "Denoising: %d steps, %d CFG branches, timestep_shift=%.1f",
+            len(timesteps), num_cfg_branches, timestep_shift,
+        )
+        denoise_t0 = time.perf_counter()
+
         for i, t in enumerate(timesteps):
+            step_t0 = time.perf_counter()
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if t > cfg_interval[0] and t <= cfg_interval[1]:
                 cfg_text_scale_ = cfg_text_scale
@@ -1365,6 +1379,19 @@ class Bagel(nn.Module):
             )
 
             x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+            step_dt = time.perf_counter() - step_t0
+            logger.info(
+                "  Step %d/%d  t=%.4f  %.3fs",
+                i + 1, len(timesteps), t.item(), step_dt,
+            )
+
+        denoise_total = time.perf_counter() - denoise_t0
+        num_steps = len(timesteps)
+        avg_step = denoise_total / num_steps if num_steps > 0 else 0.0
+        logger.info(
+            "Denoising done: %d steps in %.3fs (avg %.3fs/step)",
+            num_steps, denoise_total, avg_step,
+        )
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
 

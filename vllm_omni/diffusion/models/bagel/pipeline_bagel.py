@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
@@ -278,6 +279,7 @@ class BagelPipeline(nn.Module):
 
     @torch.inference_mode()
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        pipeline_t0 = time.perf_counter()
         if len(req.prompts) > 1:
             logger.warning(
                 """This model only supports a single prompt, not a batched request.""",
@@ -566,6 +568,10 @@ class BagelPipeline(nn.Module):
             if torch.is_tensor(v):
                 generation_input_cfg_img[k] = v.to(self.device)
 
+        prefill_elapsed = time.perf_counter() - pipeline_t0
+        logger.info("Context prefill done in %.3fs", prefill_elapsed)
+
+        denoise_t0 = time.perf_counter()
         with torch.autocast(
             device_type=self.device.type,
             enabled=self.device.type != "cpu",
@@ -593,7 +599,17 @@ class BagelPipeline(nn.Module):
                 cfg_img_packed_key_value_indexes=generation_input_cfg_img["cfg_packed_key_value_indexes"],
             )
 
+        denoise_elapsed = time.perf_counter() - denoise_t0
+
+        decode_t0 = time.perf_counter()
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
+        decode_elapsed = time.perf_counter() - decode_t0
+
+        total_elapsed = time.perf_counter() - pipeline_t0
+        logger.info(
+            "Pipeline total: %.3fs  (prefill=%.3fs, denoise=%.3fs, vae_decode=%.3fs)",
+            total_elapsed, prefill_elapsed, denoise_elapsed, decode_elapsed,
+        )
         return DiffusionOutput(output=img)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
