@@ -1383,8 +1383,11 @@ class Bagel(nn.Module):
 
         torch.cuda.synchronize()
         denoise_total = time.time() - denoise_t0
-        logger.info("Denoising done: %d steps in %.3fs (avg %.3fs/step)",
-                    num_steps, denoise_total, denoise_total / num_steps)
+        if num_steps > 0:
+            logger.info("Denoising done: %d steps in %.3fs (avg %.3fs/step)",
+                        num_steps, denoise_total, denoise_total / num_steps)
+        else:
+            logger.info("Denoising done: 0 steps (skipped)")
 
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
