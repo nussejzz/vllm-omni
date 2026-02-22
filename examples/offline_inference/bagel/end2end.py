@@ -81,15 +81,15 @@ def main():
 
     from PIL import Image
 
-    if args.modality == "img2img":
+    if args.modality in ("img2img", "text2img"):
         from PIL import Image
 
         from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 
-        print("[Info] Running in img2img mode (Stage 1 only)")
+        print(f"[Info] Running in {args.modality} mode (Stage 1 only)")
         client = OmniDiffusion(model=model_name)
 
-        if args.image_path:
+        if args.modality == "img2img" and args.image_path:
             if os.path.exists(args.image_path):
                 loaded_image = Image.open(args.image_path).convert("RGB")
                 prompts = [
@@ -102,6 +102,9 @@ def main():
             else:
                 print(f"[Warning] Image path {args.image_path} does not exist.")
 
+        # For text2img: no image → cfg_img_scale=1.0 (2 CFG branches only)
+        cfg_img_scale = args.cfg_img_scale if args.modality == "img2img" else 1.0
+
         result = client.generate(
             prompts,
             OmniDiffusionSamplingParams(
@@ -110,7 +113,7 @@ def main():
                 num_inference_steps=args.steps,
                 extra_args={
                     "cfg_text_scale": args.cfg_text_scale,
-                    "cfg_img_scale": args.cfg_img_scale,
+                    "cfg_img_scale": cfg_img_scale,
                 },
             ),
         )
