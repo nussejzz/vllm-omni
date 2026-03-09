@@ -2419,8 +2419,8 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
         self._guidance_scale = guidance_scale
         self._guidance_rescale = guidance_rescale
 
-        # Detect CFG parallel configuration
-        cfg_parallel_ready = self.do_classifier_free_guidance and get_classifier_free_guidance_world_size() > 1
+        # Detect CFG parallel configuration (only 2-branch layout is supported)
+        cfg_parallel_ready = self.do_classifier_free_guidance and get_classifier_free_guidance_world_size() == 2
 
         # Define call parameters
         device = self._execution_device
