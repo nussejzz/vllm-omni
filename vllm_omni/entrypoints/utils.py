@@ -330,6 +330,11 @@ def load_and_resolve_stage_configs(
     return config_path, stage_configs
 
 
+_MODALITY_OUTPUT_ALIASES: dict[str, str] = {
+    "img2img": "image",
+}
+
+
 def get_final_stage_id_for_e2e(
     output_modalities: list[str] | None, default_modalities: list[str], stage_list: list
 ) -> int:
@@ -345,11 +350,12 @@ def get_final_stage_id_for_e2e(
     if output_modalities is not None:
         prompt_modalities = []
         for modality in output_modalities:
-            if modality not in default_modalities:
+            resolved = _MODALITY_OUTPUT_ALIASES.get(modality, modality)
+            if resolved not in default_modalities:
                 logger.warning(f"Invalid output modality: {modality}, ignoring it")
                 # TODO: if user specifies unsupported modalities, invalid it and raise an error
                 continue
-            prompt_modalities.append(modality)
+            prompt_modalities.append(resolved)
         output_modalities = prompt_modalities
     else:
         output_modalities = default_modalities

@@ -293,6 +293,7 @@ class AsyncOmniEngine:
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors in orchestrator thread and assign to self."""
+        from vllm_omni.platforms import current_omni_platform
 
         num_stages = self.num_stages
         stage_clients: list[Any | None] = [None] * num_stages
@@ -327,8 +328,21 @@ class AsyncOmniEngine:
                     )
 
                     if metadata.stage_type == "diffusion":
-                        setup_stage_devices(stage_id, metadata.runtime_cfg)
-                        stage_clients[stage_id] = initialize_diffusion_stage(self.model, stage_cfg, metadata)
+                        with self._llm_stage_launch_lock:
+                            previous_visible_devices = os.environ.get(
+                                current_omni_platform.device_control_env_var
+                            )
+                            try:
+                                setup_stage_devices(stage_id, metadata.runtime_cfg)
+                                stage_clients[stage_id] = initialize_diffusion_stage(
+                                    self.model, stage_cfg, metadata
+                                )
+                            finally:
+                                env_key = current_omni_platform.device_control_env_var
+                                if previous_visible_devices is None:
+                                    os.environ.pop(env_key, None)
+                                else:
+                                    os.environ[env_key] = previous_visible_devices
                         logger.info("[AsyncOmniEngine] Stage %s initialized (diffusion)", stage_id)
                         continue
 
