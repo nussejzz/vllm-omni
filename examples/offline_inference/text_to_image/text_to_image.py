@@ -321,6 +321,7 @@ def main():
 
     omni_kwargs = {
         "model": args.model,
+        "stage_configs_path": args.stage_configs_path,
         "enable_layerwise_offload": args.enable_layerwise_offload,
         "vae_use_slicing": args.vae_use_slicing,
         "vae_use_tiling": args.vae_use_tiling,
