@@ -2803,25 +2803,17 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
                     # TeaCache fast path: reuse previous prediction
                     pred = tc_prev_pred
 
-                # Perform guidance and scheduler step
+                # Perform guidance
                 if cfg_parallel_ready:
-                    # CFG parallel: all_gather → rank 0 combines + steps → broadcast
+                    # CFG parallel: all_gather → all ranks combine locally (no broadcast needed)
                     gathered = cfg_group.all_gather(pred, separate_tensors=True)
-                    if cfg_rank == 0:
-                        pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
-                        latents = self.scheduler.step(
-                            pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False
-                        )[0]
-                    # Ensure consistent dtype before broadcast (scheduler may upcast to float32)
-                    latents = latents.to(dtype=torch.bfloat16).contiguous()
-                    cfg_group.broadcast(latents, src=0)
-                else:
-                    if self.do_classifier_free_guidance:
-                        pred_cond, pred_uncond = pred.chunk(2)
-                        pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
-                    latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[
-                        0
-                    ]
+                    pred = self.cfg_operator(gathered[0], gathered[1], self.guidance_scale, step=i)
+                elif self.do_classifier_free_guidance:
+                    pred_cond, pred_uncond = pred.chunk(2)
+                    pred = self.cfg_operator(pred_cond, pred_uncond, self.guidance_scale, step=i)
+
+                # Scheduler step (all ranks compute locally in CFG parallel)
+                latents = self.scheduler.step(pred, t, latents, **_scheduler_step_extra_kwargs, return_dict=False)[0]
                 if i != len(timesteps) - 1 and should_compute:
                     model_kwargs = self.model._update_model_kwargs_for_generation(  # noqa
                         model_output,
