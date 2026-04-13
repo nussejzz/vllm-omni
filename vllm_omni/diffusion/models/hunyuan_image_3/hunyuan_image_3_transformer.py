@@ -901,17 +901,16 @@ class ImageKVCacheManager:
         key = key.reshape(-1, num_kv_heads, head_dim)
         value = value.reshape(-1, num_kv_heads, head_dim)
 
+        # Cache text KV only. eoi is never attended to in steps 2-50
+        # (last mask column is all-False), so caching it is unnecessary.
         cached_prompt_len = seq_len - self.image_token_len - 1
-        cached_key = [key[:cached_prompt_len], key[seq_len - 1 : seq_len]]
-        cached_value = [value[:cached_prompt_len], value[seq_len - 1 : seq_len]]
+        cached_key = [key[:cached_prompt_len]]
+        cached_value = [value[:cached_prompt_len]]
 
         if bs > 1:
             assert bs == 2, "for cfg case, bs must be 2"
             cached_key.append(key[seq_len : seq_len + cached_prompt_len])
-            cached_key.append(key[-1:])
-
             cached_value.append(value[seq_len : seq_len + cached_prompt_len])
-            cached_value.append(value[-1:])
 
         cached_key = torch.cat(cached_key, dim=0)
         cached_value = torch.cat(cached_value, dim=0)
@@ -926,37 +925,30 @@ class ImageKVCacheManager:
         cached_key, cached_value = self.image_kv_cache_map
         bs, q_len, num_kv_heads, head_dim = key.shape
 
-        cached_prompt_len = cached_key.shape[0] // bs - 1
+        # Cache stores text KV only (no eoi).
+        cached_prompt_len = cached_key.shape[0] // bs
         assert (cached_prompt_len + 1) == (seq_len - q_len), f"{cached_prompt_len + 1} != {seq_len - q_len}"
 
         key = key.reshape(-1, num_kv_heads, head_dim)
         value = value.reshape(-1, num_kv_heads, head_dim)
 
-        new_key = [
-            cached_key[:cached_prompt_len],
-            key[:q_len],
-            cached_key[cached_prompt_len : cached_prompt_len + 1],
-        ]
-        new_value = [
-            cached_value[:cached_prompt_len],
-            value[:q_len],
-            cached_value[cached_prompt_len : cached_prompt_len + 1],
-        ]
+        # Reconstruct KV as [text | image] — no eoi appended.
+        new_key = [cached_key[:cached_prompt_len], key[:q_len]]
+        new_value = [cached_value[:cached_prompt_len], value[:q_len]]
 
         if bs > 1:
             assert bs == 2, "for cfg case, bs must be 2"
-            new_key.append(cached_key[cached_prompt_len + 1 : cached_prompt_len + 1 + cached_prompt_len])
+            new_key.append(cached_key[cached_prompt_len : 2 * cached_prompt_len])
             new_key.append(key[q_len:])
-            new_key.append(cached_key[-1:])
 
-            new_value.append(cached_value[cached_prompt_len + 1 : cached_prompt_len + 1 + cached_prompt_len])
+            new_value.append(cached_value[cached_prompt_len : 2 * cached_prompt_len])
             new_value.append(value[q_len:])
-            new_value.append(cached_value[-1:])
 
         new_key = torch.cat(new_key, dim=0)
         new_value = torch.cat(new_value, dim=0)
-        new_key = new_key.reshape(bs, seq_len, num_kv_heads, head_dim)
-        new_value = new_value.reshape(bs, seq_len, num_kv_heads, head_dim)
+        kv_len = cached_prompt_len + q_len  # seq_len - 1 (no eoi)
+        new_key = new_key.reshape(bs, kv_len, num_kv_heads, head_dim)
+        new_value = new_value.reshape(bs, kv_len, num_kv_heads, head_dim)
 
         return new_key.contiguous(), new_value.contiguous()
 
@@ -1062,6 +1054,9 @@ class ImageKVCacheManager:
         else:
             if self.sp_size <= 1:
                 key, value = self._update_image_kv_caches(key, value, seq_len)
+                # KV no longer contains eoi — trim mask's last K column to match.
+                if attention_mask is not None:
+                    attention_mask = attention_mask[..., :-1]
             else:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._sp_get_prompt_kv_caches(key, seq_len)
@@ -1074,26 +1069,24 @@ class ImageKVCacheManager:
             # Steps 2-50, best path: packed varlen, one kernel, zero mask, exact.
             # Q = [timestamp(1) | image(q_len-1)]
             # timestamp attends to text+ts only; image attends to text+ts+image.
-            # Exclude eoi from KV — all Q tokens are causally before it.
+            # KV already excludes eoi (removed from cache).
             #
             # Pack as two sub-sequences in one varlen call:
             #   sub-seq 0: Q=timestamp(1), KV=text+timestamp(N+1)
-            #   sub-seq 1: Q=image(q_len-1), KV=text+ts+image(seq_len-1)
+            #   sub-seq 1: Q=image(q_len-1), KV=text+ts+image(kv_len)
             cached_prompt_len = seq_len - q_len - 1  # text token count
             ts_kv_len = cached_prompt_len + 1  # text + timestamp itself
-            kv_no_last = key[:, :-1]
-            v_no_last = value[:, :-1]
+            kv_len = key.shape[1]  # seq_len - 1 (no eoi)
 
             outputs = []
             for b in range(bs):
                 q_packed = query[b]  # (q_len, H, D)
-                k_packed = torch.cat([kv_no_last[b, :ts_kv_len], kv_no_last[b]], dim=0)
-                v_packed = torch.cat([v_no_last[b, :ts_kv_len], v_no_last[b]], dim=0)
+                k_packed = torch.cat([key[b, :ts_kv_len], key[b]], dim=0)
+                v_packed = torch.cat([value[b, :ts_kv_len], value[b]], dim=0)
 
-                kv_full_len = seq_len - 1
                 cu_seqlens_q = torch.tensor([0, 1, q_len], dtype=torch.int32, device=query.device)
                 cu_seqlens_k = torch.tensor(
-                    [0, ts_kv_len, ts_kv_len + kv_full_len],
+                    [0, ts_kv_len, ts_kv_len + kv_len],
                     dtype=torch.int32,
                     device=query.device,
                 )
@@ -1105,7 +1098,7 @@ class ImageKVCacheManager:
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k=cu_seqlens_k,
                     max_seqlen_q=q_len - 1,
-                    max_seqlen_k=kv_full_len,
+                    max_seqlen_k=kv_len,
                     causal=False,
                 )
                 outputs.append(_unwrap_flash_output(out))
@@ -1116,15 +1109,14 @@ class ImageKVCacheManager:
         elif not first_step and _flash_ok and self.sp_size <= 1:
             # Steps 2-50, fallback: two Attention layer calls, exact.
             # Split timestamp and image into separate calls to avoid 4D mask.
+            # KV already excludes eoi (removed from cache).
             cached_prompt_len = seq_len - q_len - 1
             ts_kv_len = cached_prompt_len + 1  # text + timestamp itself
-            kv_no_last = key[:, :-1]
-            v_no_last = value[:, :-1]
 
             # timestamp(1) -> text+ts(N+1): full attention
-            out_ts = self.attn(query[:, :1], kv_no_last[:, :ts_kv_len], v_no_last[:, :ts_kv_len])
-            # image(q_len-1) -> text+ts+image(seq_len-1): full attention
-            out_img = self.attn(query[:, 1:], kv_no_last, v_no_last)
+            out_ts = self.attn(query[:, :1], key[:, :ts_kv_len], value[:, :ts_kv_len])
+            # image(q_len-1) -> text+ts+image(kv_len): full attention
+            out_img = self.attn(query[:, 1:], key, value)
             attn_output = torch.cat([out_ts, out_img], dim=1)
             attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
 
@@ -1169,32 +1161,34 @@ class ImageKVCacheManager:
             attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
 
         elif first_step and _flash_ok and self.sp_size <= 1 and _has_fa:
-            # Step 1, non-SP: causal (text+ts) + full (image) + full (eoi).
-            # Eliminates 4D mask and repeat_kv for the first denoising step.
+            # Step 1, non-SP: causal (text+ts) + full (image).
+            # eoi output is discarded by ragged_final_layer — skip its computation.
             cached_prompt_len = seq_len - self.image_token_len - 1
-            ts_end = cached_prompt_len + 1   # text + timestamp
-            img_end = seq_len - 1            # before eoi
+            ts_end = cached_prompt_len + 1  # text + timestamp
+            img_end = seq_len - 1  # before eoi
 
             # Block 1: text+timestamp — causal attention
             out_causal = _flash_attn_func(
-                query[:, :ts_end], key[:, :ts_end], value[:, :ts_end],
-                causal=True, softmax_scale=self.scaling,
+                query[:, :ts_end],
+                key[:, :ts_end],
+                value[:, :ts_end],
+                causal=True,
+                softmax_scale=self.scaling,
             )
             out_causal = _unwrap_flash_output(out_causal)
 
-            # Block 2: image — full attention to text+ts+image (no eoi)
+            # Block 2: image — full attention to text+ts+image
             out_image = _flash_attn_func(
-                query[:, ts_end:img_end], key[:, :img_end], value[:, :img_end],
-                causal=False, softmax_scale=self.scaling,
+                query[:, ts_end:img_end],
+                key[:, :img_end],
+                value[:, :img_end],
+                causal=False,
+                softmax_scale=self.scaling,
             )
             out_image = _unwrap_flash_output(out_image)
 
-            # Block 3: eoi — full attention to entire sequence
-            out_eoi = _flash_attn_func(
-                query[:, img_end:], key, value,
-                causal=False, softmax_scale=self.scaling,
-            )
-            out_eoi = _unwrap_flash_output(out_eoi)
+            # eoi placeholder — zeros, never used downstream
+            out_eoi = torch.zeros_like(query[:, img_end:])
 
             attn_output = torch.cat([out_causal, out_image, out_eoi], dim=1)
             attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
@@ -1206,8 +1200,11 @@ class ImageKVCacheManager:
 
             # Block 1: text — causal attention (local, no SP needed)
             out_text = _flash_attn_func(
-                joint_text_query, joint_text_key, joint_text_value,
-                causal=True, softmax_scale=self.scaling,
+                joint_text_query,
+                joint_text_key,
+                joint_text_value,
+                causal=True,
+                softmax_scale=self.scaling,
             )
             out_text = _unwrap_flash_output(out_text)
 
@@ -1231,8 +1228,11 @@ class ImageKVCacheManager:
                 k_text_ts = torch.cat([joint_text_key, k_ts], dim=1)
                 v_text_ts = torch.cat([joint_text_value, v_ts], dim=1)
                 ts_out = _flash_attn_func(
-                    q_ts, k_text_ts, v_text_ts,
-                    causal=False, softmax_scale=self.scaling,
+                    q_ts,
+                    k_text_ts,
+                    v_text_ts,
+                    causal=False,
+                    softmax_scale=self.scaling,
                 )
                 out_image[:, :1] = _unwrap_flash_output(ts_out)
 
