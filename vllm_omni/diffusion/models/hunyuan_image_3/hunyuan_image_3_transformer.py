@@ -76,6 +76,23 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 from vllm_omni.diffusion.models.hunyuan_image_3.hunyuan_fused_moe import HunyuanFusedMoE
 
+try:
+    from vllm_omni.diffusion.attention.backends.utils.fa import (
+        flash_attn_func as _flash_attn_func,
+    )
+    from vllm_omni.diffusion.attention.backends.utils.fa import (
+        flash_attn_varlen_func as _flash_attn_varlen_func,
+    )
+except ImportError:
+    _flash_attn_func = None
+    _flash_attn_varlen_func = None
+
+
+def _unwrap_flash_output(out: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """FA3 may return (out, lse); FA2 returns out. Unwrap to plain tensor."""
+    return out[0] if isinstance(out, tuple) else out
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -1049,33 +1066,131 @@ class ImageKVCacheManager:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._sp_get_prompt_kv_caches(key, seq_len)
 
-        key = repeat_kv(key, repeat_num)
-        value = repeat_kv(value, repeat_num)
-        if self.sp_size > 1:
-            joint_text_key = repeat_kv(joint_text_key, repeat_num)
-            joint_text_value = repeat_kv(joint_text_value, repeat_num)
+        can_flash = not first_step and query.dtype in (torch.float16, torch.bfloat16)
 
-        attention_mask = attention_mask.contiguous()
+        if can_flash and self.sp_size <= 1 and _flash_attn_varlen_func is not None:
+            # Steps 2-50, best path: packed varlen, one kernel, zero mask, exact.
+            # Q = [timestamp(1) | image(q_len-1)]
+            # timestamp attends to text+ts only; image attends to text+ts+image.
+            # Exclude eoi from KV — all Q tokens are causally before it.
+            #
+            # Pack as two sub-sequences in one varlen call:
+            #   sub-seq 0: Q=timestamp(1), KV=text+timestamp(N+1)
+            #   sub-seq 1: Q=image(q_len-1), KV=text+ts+image(seq_len-1)
+            cached_prompt_len = seq_len - q_len - 1  # text token count
+            ts_kv_len = cached_prompt_len + 1  # text + timestamp itself
+            kv_no_last = key[:, :-1]
+            v_no_last = value[:, :-1]
 
-        if self.sp_size <= 1:
-            attn_metadata = AttentionMetadata(
-                attn_mask=attention_mask,
-            )
-        else:
+            outputs = []
+            for b in range(bs):
+                q_packed = query[b]  # (q_len, H, D)
+                k_packed = torch.cat([kv_no_last[b, :ts_kv_len], kv_no_last[b]], dim=0)
+                v_packed = torch.cat([v_no_last[b, :ts_kv_len], v_no_last[b]], dim=0)
+
+                kv_full_len = seq_len - 1
+                cu_seqlens_q = torch.tensor([0, 1, q_len], dtype=torch.int32, device=query.device)
+                cu_seqlens_k = torch.tensor(
+                    [0, ts_kv_len, ts_kv_len + kv_full_len],
+                    dtype=torch.int32,
+                    device=query.device,
+                )
+
+                out = _flash_attn_varlen_func(
+                    q_packed.contiguous(),
+                    k_packed.contiguous(),
+                    v_packed.contiguous(),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=q_len - 1,
+                    max_seqlen_k=kv_full_len,
+                    causal=False,
+                )
+                outputs.append(_unwrap_flash_output(out))
+
+            attn_output = torch.stack(outputs, dim=0)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+        elif can_flash and self.sp_size <= 1:
+            # Steps 2-50, fallback: two Attention layer calls, exact.
+            # Split timestamp and image into separate calls to avoid 4D mask.
+            cached_prompt_len = seq_len - q_len - 1
+            ts_kv_len = cached_prompt_len + 1  # text + timestamp itself
+            kv_no_last = key[:, :-1]
+            v_no_last = value[:, :-1]
+
+            # timestamp(1) -> text+ts(N+1): full attention
+            out_ts = self.attn(query[:, :1], kv_no_last[:, :ts_kv_len], v_no_last[:, :ts_kv_len])
+            # image(q_len-1) -> text+ts+image(seq_len-1): full attention
+            out_img = self.attn(query[:, 1:], kv_no_last, v_no_last)
+            attn_output = torch.cat([out_ts, out_img], dim=1)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+        elif can_flash and self.sp_size > 1 and _flash_attn_func is not None:
+            # Steps 2-50, SP mode: maskless SP Attention + local timestamp fix.
+            # FlashAttention handles GQA natively — no repeat_kv, no 4D mask.
+            # After Ulysses AllToAll, each rank runs full attention on the
+            # gathered sequence with H/P heads. Timestamp output on rank 0
+            # is wrong (attends to image tokens too), so we fix it locally.
+            #
+            # Padding tokens (<sp_size) participate without mask; impact is
+            # negligible (<0.2% attention mass) and outputs are discarded.
+
+            # Save timestamp Q/KV on rank 0 for local correction
+            if self.sp_rank == 0:
+                q_ts = query[:, :1]
+                k_ts = key[:, :1]
+                v_ts = value[:, :1]
+
+            # SP Attention: full attention, no mask, no repeat_kv
             attn_metadata = AttentionMetadata(
                 joint_query=joint_text_query,
                 joint_key=joint_text_key,
                 joint_value=joint_text_value,
                 joint_strategy="front",
-                attn_mask=attention_mask,
             )
-        # Compute attention using unified attention layer
-        attn_output = self.attn(query, key, value, attn_metadata)
+            attn_output = self.attn(query, key, value, attn_metadata)
 
-        # attn_output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0)
+            # Fix timestamp on rank 0: attend only to text + timestamp
+            if self.sp_rank == 0:
+                k_text_ts = torch.cat([joint_text_key, k_ts], dim=1)
+                v_text_ts = torch.cat([joint_text_value, v_ts], dim=1)
+                ts_out = _flash_attn_func(
+                    q_ts,
+                    k_text_ts,
+                    v_text_ts,
+                    causal=False,
+                    softmax_scale=self.scaling,
+                )
+                attn_output[:, :1] = _unwrap_flash_output(ts_out)
 
-        # attn_output = attn_output.transpose(1, 2).contiguous()  # [bs, q_len, heads, head_dim]
-        attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+        else:
+            # Step 1, or dtype/flash fallback: use Attention layer with 4D mask.
+            key = repeat_kv(key, repeat_num)
+            value = repeat_kv(value, repeat_num)
+            if self.sp_size > 1:
+                joint_text_key = repeat_kv(joint_text_key, repeat_num)
+                joint_text_value = repeat_kv(joint_text_value, repeat_num)
+
+            attention_mask = attention_mask.contiguous()
+
+            if self.sp_size <= 1:
+                attn_metadata = AttentionMetadata(
+                    attn_mask=attention_mask,
+                )
+            else:
+                attn_metadata = AttentionMetadata(
+                    joint_query=joint_text_query,
+                    joint_key=joint_text_key,
+                    joint_value=joint_text_value,
+                    joint_strategy="front",
+                    attn_mask=attention_mask,
+                )
+            attn_output = self.attn(query, key, value, attn_metadata)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
         return attn_output
 
 
