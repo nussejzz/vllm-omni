@@ -1066,9 +1066,11 @@ class ImageKVCacheManager:
                 joint_text_query = query[:, :0, :, :]
                 joint_text_key, joint_text_value = self._sp_get_prompt_kv_caches(key, seq_len)
 
-        can_flash = not first_step and query.dtype in (torch.float16, torch.bfloat16)
+        _flash_ok = query.dtype in (torch.float16, torch.bfloat16)
+        _has_fa = _flash_attn_func is not None
+        _has_varlen = _flash_attn_varlen_func is not None
 
-        if can_flash and self.sp_size <= 1 and _flash_attn_varlen_func is not None:
+        if not first_step and _flash_ok and self.sp_size <= 1 and _has_varlen:
             # Steps 2-50, best path: packed varlen, one kernel, zero mask, exact.
             # Q = [timestamp(1) | image(q_len-1)]
             # timestamp attends to text+ts only; image attends to text+ts+image.
@@ -1111,7 +1113,7 @@ class ImageKVCacheManager:
             attn_output = torch.stack(outputs, dim=0)
             attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
 
-        elif can_flash and self.sp_size <= 1:
+        elif not first_step and _flash_ok and self.sp_size <= 1:
             # Steps 2-50, fallback: two Attention layer calls, exact.
             # Split timestamp and image into separate calls to avoid 4D mask.
             cached_prompt_len = seq_len - q_len - 1
@@ -1126,7 +1128,7 @@ class ImageKVCacheManager:
             attn_output = torch.cat([out_ts, out_img], dim=1)
             attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
 
-        elif can_flash and self.sp_size > 1 and _flash_attn_func is not None:
+        elif not first_step and _flash_ok and self.sp_size > 1 and _has_fa:
             # Steps 2-50, SP mode: maskless SP Attention + local timestamp fix.
             # FlashAttention handles GQA natively — no repeat_kv, no 4D mask.
             # After Ulysses AllToAll, each rank runs full attention on the
@@ -1166,8 +1168,79 @@ class ImageKVCacheManager:
 
             attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
 
+        elif first_step and _flash_ok and self.sp_size <= 1 and _has_fa:
+            # Step 1, non-SP: causal (text+ts) + full (image) + full (eoi).
+            # Eliminates 4D mask and repeat_kv for the first denoising step.
+            cached_prompt_len = seq_len - self.image_token_len - 1
+            ts_end = cached_prompt_len + 1   # text + timestamp
+            img_end = seq_len - 1            # before eoi
+
+            # Block 1: text+timestamp — causal attention
+            out_causal = _flash_attn_func(
+                query[:, :ts_end], key[:, :ts_end], value[:, :ts_end],
+                causal=True, softmax_scale=self.scaling,
+            )
+            out_causal = _unwrap_flash_output(out_causal)
+
+            # Block 2: image — full attention to text+ts+image (no eoi)
+            out_image = _flash_attn_func(
+                query[:, ts_end:img_end], key[:, :img_end], value[:, :img_end],
+                causal=False, softmax_scale=self.scaling,
+            )
+            out_image = _unwrap_flash_output(out_image)
+
+            # Block 3: eoi — full attention to entire sequence
+            out_eoi = _flash_attn_func(
+                query[:, img_end:], key, value,
+                causal=False, softmax_scale=self.scaling,
+            )
+            out_eoi = _unwrap_flash_output(out_eoi)
+
+            attn_output = torch.cat([out_causal, out_image, out_eoi], dim=1)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
+        elif first_step and _flash_ok and self.sp_size > 1 and _has_fa:
+            # Step 1, SP: causal (text, local) + full (image, SP) + timestamp fix.
+            # Text is computed locally on all ranks. Image goes through SP with
+            # text as joint KV. Timestamp on rank 0 is fixed locally.
+
+            # Block 1: text — causal attention (local, no SP needed)
+            out_text = _flash_attn_func(
+                joint_text_query, joint_text_key, joint_text_value,
+                causal=True, softmax_scale=self.scaling,
+            )
+            out_text = _unwrap_flash_output(out_text)
+
+            # Save timestamp Q/KV on rank 0 for local correction
+            if self.sp_rank == 0:
+                q_ts = query[:, :1]
+                k_ts = key[:, :1]
+                v_ts = value[:, :1]
+
+            # Block 2: image shard — full attention with SP, text as joint KV
+            attn_metadata = AttentionMetadata(
+                joint_query=query[:, :0, :, :],
+                joint_key=joint_text_key,
+                joint_value=joint_text_value,
+                joint_strategy="front",
+            )
+            out_image = self.attn(query, key, value, attn_metadata)
+
+            # Fix timestamp on rank 0: attend only to text + timestamp
+            if self.sp_rank == 0:
+                k_text_ts = torch.cat([joint_text_key, k_ts], dim=1)
+                v_text_ts = torch.cat([joint_text_value, v_ts], dim=1)
+                ts_out = _flash_attn_func(
+                    q_ts, k_text_ts, v_text_ts,
+                    causal=False, softmax_scale=self.scaling,
+                )
+                out_image[:, :1] = _unwrap_flash_output(ts_out)
+
+            attn_output = torch.cat([out_text, out_image], dim=1)
+            attn_output = attn_output.reshape(bs * q_len, head_num_per_rank, head_dim)
+
         else:
-            # Step 1, or dtype/flash fallback: use Attention layer with 4D mask.
+            # Dtype/flash fallback: use Attention layer with 4D mask.
             key = repeat_kv(key, repeat_num)
             value = repeat_kv(value, repeat_num)
             if self.sp_size > 1:
