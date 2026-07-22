@@ -968,6 +968,11 @@ class AsyncOmniEngine:
         if parallel_config is None:
             ulysses_degree = normalized_kwargs.get("ulysses_degree") or 1
             ring_degree = normalized_kwargs.get("ring_degree") or 1
+            context_parallel_degree = normalized_kwargs.get("context_parallel_degree")
+            if context_parallel_degree is None:
+                from vllm_omni.diffusion import envs
+
+                context_parallel_degree = envs.VLLM_OMNI_CP_DEGREE
             ulysses_mode = normalized_kwargs.get("ulysses_mode") or "strict"
             sequence_parallel_size = normalized_kwargs.get("sequence_parallel_size")
             pipeline_parallel_size = normalized_kwargs.get("pipeline_parallel_size") or 1
@@ -982,7 +987,7 @@ class AsyncOmniEngine:
             hsdp_shard_size = normalized_kwargs.get("hsdp_shard_size", -1)
             hsdp_replicate_size = normalized_kwargs.get("hsdp_replicate_size", 1)
             if sequence_parallel_size is None:
-                sequence_parallel_size = ulysses_degree * ring_degree
+                sequence_parallel_size = ulysses_degree * ring_degree * context_parallel_degree
 
             parallel_config = DiffusionParallelConfig(
                 pipeline_parallel_size=pipeline_parallel_size,
@@ -992,6 +997,7 @@ class AsyncOmniEngine:
                 sequence_parallel_size=sequence_parallel_size,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
+                context_parallel_degree=context_parallel_degree,
                 ulysses_mode=ulysses_mode,
                 cfg_parallel_size=cfg_parallel_size,
                 vae_patch_parallel_size=vae_patch_parallel_size,
