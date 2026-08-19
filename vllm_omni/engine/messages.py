@@ -58,6 +58,8 @@ class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
     args: tuple[object, ...]
     kwargs: dict[str, object]
     stage_ids: list[int] | None
+    unique_reply_rank: int | None = None
+    exec_all_ranks: bool = False
 
 
 class ShutdownRequestMessage(EngineQueueMessage, kw_only=True):

@@ -876,6 +876,8 @@ class Orchestrator:
         args = tuple(msg.args)
         kwargs = dict(msg.kwargs or {})
         requested_stage_ids = msg.stage_ids
+        unique_reply_rank = msg.unique_reply_rank
+        exec_all_ranks = bool(msg.exec_all_ranks)
 
         target_pools: list[StagePool] = []
         if requested_stage_ids is None:
@@ -897,6 +899,8 @@ class Orchestrator:
                     timeout=timeout,
                     args=args,
                     kwargs=kwargs,
+                    unique_reply_rank=unique_reply_rank,
+                    exec_all_ranks=exec_all_ranks,
                 )
                 stage_ids.append(pool.stage_id)
                 results.append(stage_result)

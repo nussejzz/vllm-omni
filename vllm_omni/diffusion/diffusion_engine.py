@@ -153,6 +153,7 @@ class _RpcTask:
     kwargs: dict | None
     deadline: float | None
     unique_reply_rank: int | None
+    exec_all_ranks: bool = False
     future: concurrent.futures.Future = field(default_factory=concurrent.futures.Future)
 
 
@@ -613,6 +614,7 @@ class DiffusionEngine:
                     args=task.args,
                     kwargs=task.kwargs,
                     unique_reply_rank=task.unique_reply_rank,
+                    exec_all_ranks=task.exec_all_ranks,
                 )
             except BaseException as exc:  # noqa: BLE001 - propagate to caller
                 # The future may have been cancelled (e.g. by a sync timeout
@@ -1060,6 +1062,7 @@ class DiffusionEngine:
         args: tuple,
         kwargs: dict | None,
         unique_reply_rank: int | None,
+        exec_all_ranks: bool = False,
     ) -> _RpcTask:
         assert isinstance(method, str), "Only string method names are supported for now"
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -1069,6 +1072,7 @@ class DiffusionEngine:
             kwargs=kwargs,
             deadline=deadline,
             unique_reply_rank=unique_reply_rank,
+            exec_all_ranks=bool(exec_all_ranks),
         )
         with self._cv:
             self._rpc_queue.put(task)
@@ -1082,6 +1086,7 @@ class DiffusionEngine:
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         """Call a method on worker processes and get results immediately.
 
@@ -1095,6 +1100,7 @@ class DiffusionEngine:
             args: Positional arguments for the method
             kwargs: Keyword arguments for the method
             unique_reply_rank: If set, only get reply from this rank
+            exec_all_ranks: Execute on every rank while keeping a unique reply
 
         Returns:
             Single result if unique_reply_rank is provided, otherwise list of results
@@ -1119,9 +1125,10 @@ class DiffusionEngine:
                         args=args,
                         kwargs=kwargs,
                         unique_reply_rank=unique_reply_rank,
+                        exec_all_ranks=exec_all_ranks,
                     )
 
-        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
+        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank, exec_all_ranks)
         try:
             return task.future.result(timeout=timeout)
         except concurrent.futures.TimeoutError as exc:
@@ -1135,6 +1142,7 @@ class DiffusionEngine:
         args: tuple = (),
         kwargs: dict | None = None,
         unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         """Async variant of :meth:`collective_rpc` for event-loop callers.
 
@@ -1142,7 +1150,7 @@ class DiffusionEngine:
         blocking the loop.
         """
         await self._check_and_start_background_loop()
-        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank)
+        task = self._submit_rpc(method, timeout, args, kwargs, unique_reply_rank, exec_all_ranks)
         aio_fut = asyncio.wrap_future(task.future)
         try:
             if timeout is None:

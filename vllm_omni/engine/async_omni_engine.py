@@ -1764,6 +1764,8 @@ class AsyncOmniEngine:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         stage_ids: list[int] | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> list[Any]:
         """Send a control RPC to the Orchestrator and wait for aggregated results.
 
@@ -1778,6 +1780,8 @@ class AsyncOmniEngine:
             args=tuple(args),
             kwargs=kwargs or {},
             stage_ids=stage_ids,
+            unique_reply_rank=unique_reply_rank,
+            exec_all_ranks=bool(exec_all_ranks),
         )
 
         transport = self._correlated_rpc_client
@@ -1801,6 +1805,8 @@ class AsyncOmniEngine:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         stage_ids: list[int] | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> list[Any]:
         """Async wrapper around collective_rpc()."""
         loop = asyncio.get_running_loop()
@@ -1812,6 +1818,8 @@ class AsyncOmniEngine:
                 args=args,
                 kwargs=kwargs,
                 stage_ids=stage_ids,
+                unique_reply_rank=unique_reply_rank,
+                exec_all_ranks=exec_all_ranks,
             ),
         )
 

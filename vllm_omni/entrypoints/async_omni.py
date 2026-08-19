@@ -979,6 +979,8 @@ class AsyncOmni(EngineClient, OmniBase):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         stage_ids: list[int] | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> list[Any]:
         """Execute a best-effort control RPC on selected stages.
 
@@ -992,6 +994,8 @@ class AsyncOmni(EngineClient, OmniBase):
             args=args,
             kwargs=kwargs,
             stage_ids=stage_ids,
+            unique_reply_rank=unique_reply_rank,
+            exec_all_ranks=exec_all_ranks,
         )
 
         unsupported_stage_ids: list[int] = []

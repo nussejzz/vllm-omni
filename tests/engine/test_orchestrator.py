@@ -130,7 +130,9 @@ class FakeStageClient:
         self._kv_sender_info = dict(kv_sender_info) if kv_sender_info is not None else None
         self.add_request_calls: list[tuple] = []
         self.abort_calls: list[list[str]] = []
-        self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
+        self.collective_rpc_calls: list[
+            tuple[str, float | None, tuple[Any, ...], dict[str, Any], int | None, bool]
+        ] = []
         self.shutdown_calls = 0
         self._engine_core_outputs = queue.Queue()
         self._diffusion_outputs = queue.Queue()
@@ -167,9 +169,13 @@ class FakeStageClient:
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         normalized_kwargs = dict(kwargs or {})
-        self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs))
+        self.collective_rpc_calls.append(
+            (method, timeout, args, normalized_kwargs, unique_reply_rank, exec_all_ranks)
+        )
         return {
             "supported": False,
             "todo": True,
@@ -221,9 +227,13 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         normalized_kwargs = dict(kwargs or {})
-        self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs))
+        self.collective_rpc_calls.append(
+            (method, timeout, args, normalized_kwargs, unique_reply_rank, exec_all_ranks)
+        )
         return self.rpc_result
 
 
@@ -2090,6 +2100,8 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
                     args=(),
                     kwargs={},
                     stage_ids=[99, 1],
+                    unique_reply_rank=2,
+                    exec_all_ranks=True,
                 )
             )
 
@@ -2104,6 +2116,7 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
         assert msg.results == [{"stage": 1}]
         assert not stage0.collective_rpc_calls
         assert len(stage1.collective_rpc_calls) == 1
+        assert stage1.collective_rpc_calls[0][-2:] == (2, True)
         assert "collective_rpc: ignoring invalid stage_id 99" in caplog.text
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)

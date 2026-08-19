@@ -414,6 +414,8 @@ class StageDiffusionClient(StageClientBase):
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any:
         """Forward control RPCs to the diffusion subprocess."""
         if self._engine_dead:
@@ -445,6 +447,8 @@ class StageDiffusionClient(StageClientBase):
                     "timeout": timeout,
                     "args": list(args),
                     "kwargs": kwargs,
+                    "unique_reply_rank": unique_reply_rank,
+                    "exec_all_ranks": bool(exec_all_ranks),
                 }
             )
         )

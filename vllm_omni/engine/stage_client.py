@@ -67,6 +67,8 @@ class StagePoolClient(StageClient, Protocol):
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
+        unique_reply_rank: int | None = None,
+        exec_all_ranks: bool = False,
     ) -> Any: ...
 
 
