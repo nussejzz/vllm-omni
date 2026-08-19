@@ -173,9 +173,7 @@ class FakeStageClient:
         exec_all_ranks: bool = False,
     ) -> Any:
         normalized_kwargs = dict(kwargs or {})
-        self.collective_rpc_calls.append(
-            (method, timeout, args, normalized_kwargs, unique_reply_rank, exec_all_ranks)
-        )
+        self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs, unique_reply_rank, exec_all_ranks))
         return {
             "supported": False,
             "todo": True,
@@ -231,9 +229,7 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
         exec_all_ranks: bool = False,
     ) -> Any:
         normalized_kwargs = dict(kwargs or {})
-        self.collective_rpc_calls.append(
-            (method, timeout, args, normalized_kwargs, unique_reply_rank, exec_all_ranks)
-        )
+        self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs, unique_reply_rank, exec_all_ranks))
         return self.rpc_result
 
 

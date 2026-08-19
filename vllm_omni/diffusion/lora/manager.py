@@ -433,9 +433,7 @@ class DiffusionLoRAManager:
                         if sub_suffixes is not None:
                             for sub_suffix in sub_suffixes:
                                 sub_full_name = f"{prefix}.{sub_suffix}" if prefix else sub_suffix
-                                sub_relative_name = (
-                                    f"{relative_prefix}.{sub_suffix}" if relative_prefix else sub_suffix
-                                )
+                                sub_relative_name = f"{relative_prefix}.{sub_suffix}" if relative_prefix else sub_suffix
                                 if _matches_target(sub_relative_name) or _matches_target(sub_full_name):
                                     should_replace = True
                                     break
