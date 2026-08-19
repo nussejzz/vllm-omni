@@ -419,7 +419,6 @@ class StageEngineCoreClientBase(StageClientBase):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         unique_reply_rank: int | None = None,
-        exec_all_ranks: bool = False,
     ) -> Any:
         """Forward control RPCs to the underlying AsyncMPClient stage engine.
 
@@ -427,7 +426,7 @@ class StageEngineCoreClientBase(StageClientBase):
         control operations should be executed here and then fanned in-core
         across the workers managed by this EngineCore client.
         """
-        if unique_reply_rank is not None or exec_all_ranks:
+        if unique_reply_rank is not None:
             raise NotImplementedError(
                 "worker-rank collective RPC routing is currently supported only by diffusion stages"
             )

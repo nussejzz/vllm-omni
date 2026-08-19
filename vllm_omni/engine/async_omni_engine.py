@@ -1765,13 +1765,16 @@ class AsyncOmniEngine:
         kwargs: dict[str, Any] | None = None,
         stage_ids: list[int] | None = None,
         unique_reply_rank: int | None = None,
-        exec_all_ranks: bool = False,
     ) -> list[Any]:
         """Send a control RPC to the Orchestrator and wait for aggregated results.
 
         This uses a dedicated RPC output queue so control-plane messages do not
         race with the normal request output polling loop.
         """
+        if unique_reply_rank is not None and (
+            isinstance(unique_reply_rank, bool) or not isinstance(unique_reply_rank, int) or unique_reply_rank < 0
+        ):
+            raise ValueError(f"unique_reply_rank must be a non-negative integer or None, got {unique_reply_rank!r}")
         rpc_id = uuid.uuid4().hex
         msg = CollectiveRPCRequestMessage(
             rpc_id=rpc_id,
@@ -1781,7 +1784,6 @@ class AsyncOmniEngine:
             kwargs=kwargs or {},
             stage_ids=stage_ids,
             unique_reply_rank=unique_reply_rank,
-            exec_all_ranks=bool(exec_all_ranks),
         )
 
         transport = self._correlated_rpc_client
@@ -1806,7 +1808,6 @@ class AsyncOmniEngine:
         kwargs: dict[str, Any] | None = None,
         stage_ids: list[int] | None = None,
         unique_reply_rank: int | None = None,
-        exec_all_ranks: bool = False,
     ) -> list[Any]:
         """Async wrapper around collective_rpc()."""
         loop = asyncio.get_running_loop()
@@ -1819,7 +1820,6 @@ class AsyncOmniEngine:
                 kwargs=kwargs,
                 stage_ids=stage_ids,
                 unique_reply_rank=unique_reply_rank,
-                exec_all_ranks=exec_all_ranks,
             ),
         )
 

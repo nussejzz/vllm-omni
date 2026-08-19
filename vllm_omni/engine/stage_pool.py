@@ -1213,7 +1213,6 @@ class StagePool:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         unique_reply_rank: int | None = None,
-        exec_all_ranks: bool = False,
     ) -> dict[str, Any] | Any:
         """Dispatch a stage-scoped control-plane RPC to one physical route."""
         kwargs = dict(kwargs or {})
@@ -1230,7 +1229,6 @@ class StagePool:
                 args=args,
                 kwargs=kwargs,
                 unique_reply_rank=unique_reply_rank,
-                exec_all_ranks=exec_all_ranks,
             )
         except Exception as exc:
             logger.exception(

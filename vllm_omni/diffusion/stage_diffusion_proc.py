@@ -210,7 +210,6 @@ class StageDiffusionProc:
         args: tuple,
         kwargs: dict,
         unique_reply_rank: int | None,
-        exec_all_ranks: bool,
     ) -> Any:
         """Dispatch collective RPC calls to DiffusionEngine.
 
@@ -218,6 +217,7 @@ class StageDiffusionProc:
         the contract that ``AsyncOmni`` provides.
         """
         loop = asyncio.get_running_loop()
+        exec_all_ranks = unique_reply_rank is not None
 
         if method == "profile":
             is_start = args[0] if args else True
@@ -447,7 +447,6 @@ class StageDiffusionProc:
                             tuple(msg.get("args", ())),
                             msg.get("kwargs", {}),
                             msg.get("unique_reply_rank"),
-                            bool(msg.get("exec_all_ranks", False)),
                         )
                         await response_socket.send(
                             encoder.encode(

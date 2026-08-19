@@ -212,7 +212,6 @@ class InlineStageDiffusionClient(StageClientBase):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         unique_reply_rank: int | None = None,
-        exec_all_ranks: bool = False,
     ) -> Any:
         loop = asyncio.get_running_loop()
 
@@ -229,6 +228,7 @@ class InlineStageDiffusionClient(StageClientBase):
             )
 
         kwargs = dict(kwargs or {})
+        exec_all_ranks = unique_reply_rank is not None
 
         # LoRA methods
         if method == "add_lora":
