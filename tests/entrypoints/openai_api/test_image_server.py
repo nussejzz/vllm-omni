@@ -1719,7 +1719,7 @@ def test_image_edit_parameter_pass(async_omni_test_client):
         img = Image.open(io.BytesIO(img_bytes))
         assert img.format.lower() == "jpeg"
         assert data["output_format"] == "jpeg"
-        assert data["size"] == "16x24"
+        assert data["size"] == "64x64"
 
 
 def test_image_edit_layers_and_resolution(async_omni_test_client):
@@ -1925,6 +1925,27 @@ def test_image_edit_explicit_size_marks_canvas_provided_single_stage(test_client
     sampling = test_client.app.state.engine_client.captured_sampling_params_list[0]
     assert (sampling.height, sampling.width) == (24, 16)
     assert (sampling.height_not_provided, sampling.width_not_provided) == (False, False)
+
+
+def test_image_edit_response_size_reports_generated_image_single_stage(test_client):
+    response = test_client.post(
+        "/v1/images/edits",
+        files=[("image", make_test_image_bytes((24, 16)))],
+        data={"prompt": "hello world.", "size": "16x24"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["size"] == "64x64"
+
+
+def test_generate_images_response_size_reports_generated_image(test_client):
+    response = test_client.post(
+        "/v1/images/generations",
+        json={"prompt": "a cat", "n": 1, "size": "1024x1024"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["size"] == "64x64"
 
 
 def test_image_edit_compression_jpeg(test_client):
