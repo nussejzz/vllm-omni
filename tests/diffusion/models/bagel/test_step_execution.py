@@ -25,6 +25,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched import StepScheduler
 from vllm_omni.diffusion.worker.input_batch import InputBatch
 from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -236,6 +237,98 @@ def test_bagel_pre_process_marks_kv_metadata_canvas_as_requested(tmp_path):
     assert (request.sampling_params.height, request.sampling_params.width) == (1024, 1024)
     assert (request.sampling_params.height_not_provided, request.sampling_params.width_not_provided) == (False, False)
     assert _bagel_canvas_requested(request.sampling_params)
+
+
+def test_bagel_pre_process_prefers_explicit_canvas_over_kv_metadata(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request(
+        (1280, 720),
+        OmniDiffusionSamplingParams(
+            num_inference_steps=2,
+            height=1024,
+            width=1024,
+            kv_metadata={"image_shape": (576, 1024)},
+        ),
+    )
+
+    pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (1024, 1024)
+    assert _bagel_canvas_requested(request.sampling_params)
+
+
+def test_bagel_pre_process_floors_unaligned_explicit_canvas_with_warning(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request(
+        (1280, 720),
+        OmniDiffusionSamplingParams(num_inference_steps=2, height=700, width=1000),
+    )
+
+    with patch("vllm_omni.diffusion.models.bagel.pipeline_bagel.logger.warning") as warning:
+        pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (688, 992)
+    assert _bagel_canvas_requested(request.sampling_params)
+    warning.assert_called_once()
+    assert "width 1000->992, height 700->688" in warning.call_args.args[-1]
+
+
+def test_bagel_pre_process_keeps_aligned_explicit_canvas_silent(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request(
+        (1280, 720),
+        OmniDiffusionSamplingParams(num_inference_steps=2, height=512, width=1024),
+    )
+
+    with patch("vllm_omni.diffusion.models.bagel.pipeline_bagel.logger.warning") as warning:
+        pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (512, 1024)
+    warning.assert_not_called()
+
+
+def test_bagel_pre_process_rejects_explicit_canvas_over_checkpoint_limit(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = _edit_request(
+        (1280, 720),
+        OmniDiffusionSamplingParams(num_inference_steps=2, height=512, width=2048),
+    )
+
+    with pytest.raises(OmniClientError, match="width=2048 exceeds the BAGEL checkpoint limit of 1024") as excinfo:
+        pre_process(request)
+
+    assert excinfo.value.status_code == 400
+
+
+def test_bagel_pre_process_aligns_text2img_canvas_too(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = OmniDiffusionRequest(
+        prompt="a cat",
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=700, width=1000),
+        request_id="req",
+    )
+
+    pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (688, 992)
+
+
+def test_bagel_pre_process_skips_canvas_alignment_for_text_output(tmp_path):
+    pre_process = _pre_process_with_stub_checkpoint(tmp_path)
+    request = OmniDiffusionRequest(
+        prompt={
+            "prompt": "describe this image",
+            "modalities": ["text"],
+            "multi_modal_data": {"image": [Image.new("RGB", (1280, 720))]},
+        },
+        sampling_params=OmniDiffusionSamplingParams(num_inference_steps=2, height=700, width=1000),
+        request_id="req",
+    )
+
+    pre_process(request)
+
+    assert (request.sampling_params.height, request.sampling_params.width) == (700, 1000)
+    assert request.use_step_execution is False
 
 
 @pytest.mark.parametrize(
