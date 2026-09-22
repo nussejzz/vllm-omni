@@ -34,6 +34,87 @@ text-to-text chat.
 - HuggingFace model page:
   [SenseNova/SenseNova-U1-8B-MoT](https://huggingface.co/SenseNova/SenseNova-U1-8B-MoT)
 
+## A3B (MoE) variant
+
+[sensenova/SenseNova-U1-A3B-MoT](https://huggingface.co/sensenova/SenseNova-U1-A3B-MoT)
+runs on this same recipe and the same `SenseNovaU1Pipeline` — the checkpoint keeps
+`model_type: neo_chat`, so it resolves without `--model-class-name`. Only the `--model`
+id changes.
+
+The backbone is Qwen3-MoE instead of dense Qwen3, and both MoT branches are sparse:
+`mlp` routes over 128 experts and `mlp_mot_gen` over 32, top-8 each, with per-expert
+width `moe_intermediate_size=768`. `SenseNovaU1Config` picks `SenseNovaU1MoELLMConfig`
+whenever `llm_config` carries `num_experts`, so the dense 8B path is untouched. The
+gen-path knobs (`gen_num_experts`, `gen_num_experts_per_tok`, `gen_moe_intermediate_size`)
+fall back to their understanding-path counterparts when absent.
+
+Experts run through vLLM's `FusedMoE`, whose `moe_forward` op resolves its layer through
+`vllm.forward_context` rather than the diffusion runner's own context, so
+`SenseNovaU1ForCausalLM.forward` enters that context when the model has MoE layers.
+
+### Memory
+
+The weights dominate, and every expert stays resident even though only the top-8 of each
+tower run per token -- the "A3B" in the name is the ~4B activated, not the 38.7B stored.
+Counted from the checkpoint's safetensors headers:
+
+| Component | Params | BF16 |
+| --- | --- | --- |
+| Understanding-path experts (128/layer) | 28.99 B | 54.0 GiB |
+| Generation-path experts (32/layer) | 7.25 B | 13.5 GiB |
+| Attention (dual tower) | 1.81 B | 3.4 GiB |
+| Embedding + LM head | 0.62 B | 1.2 GiB |
+| Routers, norms, vision and flow-matching heads | 0.06 B | 0.1 GiB |
+| Total | 38.74 B | 72.2 GiB |
+
+The 72.9 GiB peak is those 72.2 GiB of weights plus about 0.7 GiB of activations and
+workspace. Text-to-image only routes through the generation tower, leaving the 54 GiB of
+understanding-path experts idle; that tower is reached by the text prefix, think mode,
+`img2text` and `text2text`. One 96 GB card fits TP=1, and TP=2 halves the per-GPU footprint.
+
+### Measured (1x H20 96GB, BF16)
+
+- Python 3.12, vLLM 0.30.0 (`+cu129`), torch 2.13.0+cu129, CUDA 12.9 runtime,
+  `sensenova/SenseNova-U1-A3B-MoT`, seed 42, CFG scale 4.0
+- Weight loading takes 72.2 GiB and ~13 s; each timing is a second run, so the Triton and
+  compile caches are warm
+- Peak GPU memory is the reserved high-water mark reported by the runner
+
+| Case | Total | Peak GPU memory |
+| --- | --- | --- |
+| text2img 1024x1024, 50 steps, think off | 7.74 s | 72.9 GiB |
+| text2img 1024x1024, 50 steps, think on | 9.14 s | 73.0 GiB |
+| text2img 1024x1024, 50 steps, think off, TP=2 | 5.25 s | 36.7 GiB per GPU |
+| img2img 2048x2048 output, 25 steps, think off | 22.18 s | — |
+
+Think mode adds an autoregressive decode through the understanding tower before denoising
+starts, 215 tokens for this prompt. `image_edit.py` does not report peak memory, and the
+pipeline generated the edit at 2048x2048 from a 1024x1024 input, which is why its per-step
+cost is higher. At the same seed TP=2 differs from TP=1 only numerically (MAE 2.97/255,
+identical composition) from the changed reduction order.
+
+```bash
+python examples/offline_inference/text_to_image/text_to_image.py \
+    --model sensenova/SenseNova-U1-A3B-MoT \
+    --prompt "Close portrait of an elderly woman by a farmhouse window, warm natural light." \
+    --width 1024 --height 1024 \
+    --seed 42 --num-inference-steps 50 --cfg-scale 4.0 \
+    --extra-body '{"think": false, "cfg_norm": "none", "timestep_shift": 3.0, "t_eps": 0.02}' \
+    --output sensenova_a3b_t2i.png
+```
+
+`img2text` and `text2text` go through the server, as for the dense checkpoint:
+
+```bash
+vllm serve sensenova/SenseNova-U1-A3B-MoT --omni --port 8091
+
+python examples/online_serving/sensenova_u1/openai_chat_client.py \
+    -s http://127.0.0.1:8091 -m img2text -i input.png -p "Describe this image."
+```
+
+All four modalities were verified on A3B: text2img (with and without think), img2img
+editing, img2text and text2text.
+
 ## Hardware Support
 
 ## GPU
