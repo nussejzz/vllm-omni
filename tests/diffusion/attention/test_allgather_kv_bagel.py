@@ -14,7 +14,7 @@ from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     AllGatherKVParallelAttention,
     async_all_gather_sequence,
 )
-from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel
+from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel, sp_replicated_phases_run_locally
 from vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
 
 
@@ -280,3 +280,19 @@ def test_prefer_sdpa_kernel_routes_one_call_to_the_fallback(monkeypatch: pytest.
     seen.clear()
     attn._run_local_attention(q, k, v, AttentionMetadata())
     assert "backend" in seen and "sdpa" not in seen
+
+
+@pytest.mark.parametrize(
+    ("parallel_config", "expected"),
+    [
+        (None, False),
+        (SimpleNamespace(sequence_parallel_size=1, allgather_degree=1), False),
+        (SimpleNamespace(sequence_parallel_size=None, allgather_degree=1), False),
+        (SimpleNamespace(sequence_parallel_size=4, allgather_degree=4), True),
+        # Ulysses / Ring: the replicated phases must not be all-to-all'd either.
+        (SimpleNamespace(sequence_parallel_size=4, ulysses_degree=4, allgather_degree=1), True),
+        (SimpleNamespace(sequence_parallel_size=2, ring_degree=2, allgather_degree=1), True),
+    ],
+)
+def test_replicated_phases_run_locally_under_any_sequence_parallelism(parallel_config, expected) -> None:
+    assert sp_replicated_phases_run_locally(parallel_config) is expected

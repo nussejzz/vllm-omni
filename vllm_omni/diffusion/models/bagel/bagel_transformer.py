@@ -431,6 +431,24 @@ class BaseNavitOutputWithPast(ModelOutput):
     past_key_values: NaiveCache | None = None
 
 
+def sp_replicated_phases_run_locally(parallel_config: DiffusionParallelConfig | None) -> bool:
+    """Whether BAGEL's replicated phases must bypass the sequence-parallel strategy.
+
+    The causal text prefill, the ViT/VAE cache updates and the CFG cache-update
+    forward all run on sequences that every SP rank holds in full. Handing them
+    to a strategy is wrong for every strategy we have: AllGather-KV rejects the
+    causal layer and would gather one copy of K/V per rank, and Ulysses/Ring
+    all-to-all the identical per-rank copies as if they were shards (a causal
+    prefill then attends across copies, a cache update sees its K/V duplicated
+    world_size times). So any sequence parallelism at all means "run locally".
+    """
+    if parallel_config is None:
+        return False
+    if getattr(parallel_config, "allgather_degree", 1) > 1:
+        return True
+    return (getattr(parallel_config, "sequence_parallel_size", None) or 1) > 1
+
+
 class PackedAttentionMoT(nn.Module):
     """Packed attention with Mixture-of-Tokens routing for understanding/generation.
 
@@ -495,7 +513,13 @@ class PackedAttentionMoT(nn.Module):
         # it. AllGather-KV would gather one copy of K/V per rank and rejects a
         # causal layer outright, so under AllGather-KV the replicated phases run
         # their kernel locally; only the sharded denoising path uses the strategy.
-        replicated_local = parallel_config is not None and getattr(parallel_config, "allgather_degree", 1) > 1
+        # Ulysses/Ring have the same problem in a different guise: every rank
+        # holds an identical copy of a replicated sequence, and the all-to-all
+        # would splice those copies together as if they were shards (a causal
+        # text prefill then leaks across copies, a cache update sees its K/V
+        # duplicated world_size times). So every SP strategy runs the
+        # replicated phases locally.
+        replicated_local = sp_replicated_phases_run_locally(parallel_config)
         self.attn_causal = DiffusionAttention(
             num_heads=self.total_num_heads,
             head_size=self.head_dim,
@@ -711,7 +735,7 @@ class PackedAttentionMoT(nn.Module):
         # sequence, so under AllGather-KV it is a replicated phase: build the
         # per-branch sequences by hand below and run attention locally, exactly
         # like the non-SP path, instead of handing joint tensors to a strategy.
-        replicated_phase = self._is_allgather_kv_active() and update_past_key_values
+        replicated_phase = self._is_sp_active() and update_past_key_values
         if self._is_sp_active() and not replicated_phase:
             # Joint mechanism keeps text+cache replicated across SP ranks
             attn_out = self.attn_noncausal(
