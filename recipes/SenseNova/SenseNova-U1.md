@@ -67,31 +67,47 @@ Counted from the checkpoint's safetensors headers:
 | Routers, norms, vision and flow-matching heads | 0.06 B | 0.1 GiB |
 | Total | 38.74 B | 72.2 GiB |
 
-The 72.9 GiB peak is those 72.2 GiB of weights plus about 0.7 GiB of activations and
-workspace. Text-to-image only routes through the generation tower, leaving the 54 GiB of
-understanding-path experts idle; that tower is reached by the text prefix, think mode,
-`img2text` and `text2text`. One 96 GB card fits TP=1, and TP=2 halves the per-GPU footprint.
+At 1024x1024 the 72.9 GiB peak is those 72.2 GiB of weights plus about 0.7 GiB of
+activations and workspace. The 2048x2048 edit, the largest activation case below, peaks at
+74.6 GiB, 2.4 GiB above the weights. Text-to-image only routes through the generation tower,
+leaving the 54 GiB of understanding-path experts idle; that tower is reached by the text
+prefix, think mode, `img2text` and `text2text`. One 96 GB card fits TP=1, and TP=2 halves
+the per-GPU footprint.
 
 ### Measured (1x H20 96GB, BF16)
 
-- Python 3.12, vLLM 0.30.0 (`+cu129`), torch 2.13.0+cu129, CUDA 12.9 runtime,
-  `sensenova/SenseNova-U1-A3B-MoT`, seed 42, CFG scale 4.0
+- Python 3.12, vLLM 0.30.0, torch 2.13.0+cu130, CUDA 13.0 (forward-compatibility package on
+  an R535 driver), `sensenova/SenseNova-U1-A3B-MoT`, seed 42, CFG scale 4.0
 - Weight loading takes 72.2 GiB and ~13 s; each timing is a second run, so the Triton and
   compile caches are warm
-- Peak GPU memory is the reserved high-water mark reported by the runner
+- Peak GPU memory is the reserved high-water mark the runner records for the request
 
 | Case | Total | Peak GPU memory |
 | --- | --- | --- |
-| text2img 1024x1024, 50 steps, think off | 7.74 s | 72.9 GiB |
-| text2img 1024x1024, 50 steps, think on | 9.14 s | 73.0 GiB |
-| text2img 1024x1024, 50 steps, think off, TP=2 | 5.25 s | 36.7 GiB per GPU |
-| img2img 2048x2048 output, 25 steps, think off | 22.18 s | — |
+| text2img 1024x1024, 50 steps, think off | 7.75 s | 72.9 GiB |
+| text2img 1024x1024, 50 steps, think on | 9.16 s | 73.0 GiB |
+| text2img 1024x1024, 50 steps, think off, TP=2 | 5.64 s | 36.7 GiB per GPU |
+| img2img 2048x2048 output, 25 steps, think off | 20.93 s | 74.6 GiB |
 
-Think mode adds an autoregressive decode through the understanding tower before denoising
-starts, 215 tokens for this prompt. `image_edit.py` does not report peak memory, and the
-pipeline generated the edit at 2048x2048 from a 1024x1024 input, which is why its per-step
-cost is higher. At the same seed TP=2 differs from TP=1 only numerically (MAE 2.97/255,
-identical composition) from the changed reduction order.
+`--enable-diffusion-pipeline-profiler` logs the stage split below. There is no VAE: the
+denoising loop ends in unpatchify, denormalization and PIL conversion, timed on their own
+in the post-processing row.
+
+| Stage | text2img, think off | text2img, think on | img2img |
+| --- | --- | --- | --- |
+| Text prefix through the understanding tower | 0.13 s | 0.06 s | 0.23 s |
+| Think decode, 215 tokens | — | 1.37 s | — |
+| Denoising loop through the generation tower | 7.61 s | 7.66 s | 20.62 s |
+| Of which post-processing | 0.02 s | 0.02 s | 0.11 s |
+| Pipeline forward | 7.74 s | 9.15 s | 20.93 s |
+
+With think on, the conditional prefix runs inline before the decode rather than through
+`_t2i_prefix_forward`, so the prefix row holds the unconditional pass only; the conditional
+one is in the 0.06 s the listed stages leave unaccounted, matching its 0.06 s with think
+off. The img2img prefix includes the 1024 reference-image tokens. The pipeline generated
+that edit at 2048x2048 from a 1024x1024 input, which is why its per-step cost is higher. At
+the same seed TP=2 differs from TP=1 only numerically (MAE 2.97/255, identical composition)
+from the changed reduction order.
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \

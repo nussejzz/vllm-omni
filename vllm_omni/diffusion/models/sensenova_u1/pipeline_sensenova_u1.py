@@ -579,7 +579,14 @@ class SenseNovaU1Pipeline(
         ]
 
         self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
+            profiler_targets=[
+                "_t2i_prefix_forward",
+                "_it2i_prefix_forward",
+                "_generate_think",
+                "_generate_text",
+                "_run_denoising_loop",
+            ],
+            enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler,
         )
 
     # -----------------------------------------------------------------------
