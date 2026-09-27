@@ -4,8 +4,7 @@
 
 Ported from the sensenova_u1 package with vllm tensor-parallel support:
 - QKVParallelLinear for fused q/k/v projections (both und and gen paths)
-- MergedColumnParallelLinear for fused gate+up projections (dense 8B)
-- FusedMoE for Qwen3-MoE experts (A3B: und 128 experts / gen 32 experts)
+- MergedColumnParallelLinear for fused gate+up projections
 - RowParallelLinear for o_proj and down_proj
 - VocabParallelEmbedding for token embeddings
 """
@@ -238,13 +237,11 @@ class SenseNovaU1MLP(nn.Module):
 
 
 def _is_moe(config) -> bool:
-    """Whether ``llm_config`` describes the A3B MoE backbone rather than dense 8B."""
     num_experts = getattr(config, "num_experts", None)
     return isinstance(num_experts, int) and num_experts > 1
 
 
 def _is_sparse_und_layer(config, layer_idx: int) -> bool:
-    """Understanding-path sparse MoE, matching upstream Qwen3-MoE layer selection."""
     if not _is_moe(config):
         return False
     mlp_only_layers = list(getattr(config, "mlp_only_layers", None) or [])
@@ -253,13 +250,6 @@ def _is_sparse_und_layer(config, layer_idx: int) -> bool:
 
 
 class SenseNovaU1SparseMoeBlock(nn.Module):
-    """Top-k softmax-routed MoE using vLLM FusedMoE.
-
-    Parameter names (``gate.weight``, ``experts.routed_experts.w13_weight`` /
-    ``w2_weight``) match the A3B checkpoint after ``load_weights`` remaps
-    ``experts.{i}.gate_proj/up_proj/down_proj``.
-    """
-
     def __init__(
         self,
         config,
@@ -308,14 +298,6 @@ class SenseNovaU1SparseMoeBlock(nn.Module):
 
 
 def _build_mlp(config, layer_idx: int, *, gen_path: bool, quant_config=None, prefix: str = ""):
-    """Dense SwiGLU for the 8B checkpoint, sparse MoE for A3B.
-
-    A3B keeps the generation branch sparse on every layer, while the
-    understanding branch follows the upstream Qwen3-MoE ``mlp_only_layers`` /
-    ``decoder_sparse_step`` selection. The ``gen_*`` knobs are always populated
-    by :class:`SenseNovaU1MoELLMConfig`, defaulting to the understanding-path
-    values when the checkpoint omits them.
-    """
     if gen_path and _is_moe(config):
         return SenseNovaU1SparseMoeBlock(
             config,

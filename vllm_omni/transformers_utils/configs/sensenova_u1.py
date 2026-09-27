@@ -31,7 +31,6 @@ def _backfill_layer_types(config) -> None:
 
 
 def _is_moe_llm_config(llm_config) -> bool:
-    """Detect whether an ``llm_config`` (dict or object) targets a MoE backbone."""
     if isinstance(llm_config, dict):
         model_type = llm_config.get("model_type", "")
         archs = llm_config.get("architectures") or []
@@ -55,7 +54,7 @@ def _is_moe_llm_config(llm_config) -> bool:
 
 # Adapted from: https://github.com/OpenSenseNova/SenseNova-U1/blob/main/src/sensenova_u1/models/neo_unify/configuration_neo_chat.py
 class SenseNovaU1LLMConfig(Qwen3Config):
-    """Qwen3-based dense LLM backbone config with 3D RoPE extensions."""
+    """Qwen3-based LLM backbone config with 3D RoPE extensions."""
 
     model_type = "sensenova_u1_llm"
 
@@ -73,17 +72,7 @@ class SenseNovaU1LLMConfig(Qwen3Config):
 
 
 class SenseNovaU1MoELLMConfig(Qwen3MoeConfig):
-    """Qwen3-MoE backbone used by SenseNova-U1-A3B.
-
-    Every decoder layer carries two parallel sparse MoE blocks:
-
-    * ``mlp`` — understanding path (``num_experts`` / ``num_experts_per_tok`` /
-      ``moe_intermediate_size``)
-    * ``mlp_mot_gen`` — image-generation path (``gen_num_experts`` etc.)
-
-    Each gen-path knob falls back to its understanding-path counterpart when
-    unset, so vanilla single-MoE configs keep working.
-    """
+    """Qwen3-MoE LLM backbone config for SenseNova-U1-A3B."""
 
     model_type = "sensenova_u1_moe_llm"
 
@@ -111,7 +100,6 @@ class SenseNovaU1MoELLMConfig(Qwen3MoeConfig):
 
 
 def _build_llm_config(llm_config):
-    """Instantiate the right LLM config object from a dict or pre-built config."""
     if isinstance(llm_config, dict):
         if _is_moe_llm_config(llm_config):
             return SenseNovaU1MoELLMConfig(**llm_config)
@@ -153,9 +141,7 @@ class SenseNovaU1Config(PretrainedConfig):
     Nests ``llm_config`` and ``vision_config`` sub-configs alongside the
     flow-matching / diffusion parameters.  When constructed from a dict
     (e.g. via ``from_pretrained``), sub-dicts are automatically promoted
-    to their typed config objects. Dense 8B checkpoints become
-    :class:`SenseNovaU1LLMConfig`; A3B MoE checkpoints become
-    :class:`SenseNovaU1MoELLMConfig`.
+    to their typed config objects.
     """
 
     model_type = "sensenova_u1"

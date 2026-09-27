@@ -10,11 +10,9 @@ the text encoder (via KV cache) and the denoising backbone (via MoT branches).
 Key integration points:
 - Transformer layers ported with TP support (QKVParallelLinear,
   MergedColumnParallelLinear, RowParallelLinear) in sensenova_u1_transformer.py.
-  A3B additionally uses FusedMoE on both MoT branches.
 - Vision model (NEOVisionModel) and FM modules kept as standard nn.Module
   since they are lightweight (no transformer blocks).
-- Weight loading uses stacked_params_mapping for fused QKV and gate_up, plus
-  FusedMoE expert mapping for A3B ``experts.{i}.gate_proj/up_proj/down_proj``.
+- Weight loading uses stacked_params_mapping for fused QKV and gate_up.
 """
 
 from __future__ import annotations
@@ -1661,12 +1659,6 @@ class SenseNovaU1Pipeline(
         return applied
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        """FusedMoE expert mapping for A3B; empty on the dense 8B checkpoint.
-
-        Both MoT branches share one mapping, built for the wider expert pool so
-        that the understanding branch's 128 entries also cover the generation
-        branch's 32. The extra entries simply never match a checkpoint name.
-        """
         num_experts = max(
             getattr(self.llm_cfg, "num_experts", 0) or 0,
             getattr(self.llm_cfg, "gen_num_experts", 0) or 0,
@@ -1729,7 +1721,6 @@ class SenseNovaU1Pipeline(
         stacked_params_mapping: list[tuple[str, str, str | int]],
         loaded_params: set[str],
     ) -> bool:
-        """Route one checkpoint shard into its fused QKV / gate_up parameter."""
         for param_name, weight_name, shard_id in stacked_params_mapping:
             if weight_name not in name:
                 continue
@@ -1752,7 +1743,6 @@ class SenseNovaU1Pipeline(
         expert_params_mapping: list[tuple[str, str, int, str]],
         loaded_params: set[str],
     ) -> bool:
-        """Route one ``experts.{i}.*`` shard into its FusedMoE w13 / w2 slice."""
         for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
             if weight_name not in name:
                 continue
