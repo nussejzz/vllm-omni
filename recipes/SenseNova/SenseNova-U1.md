@@ -76,38 +76,61 @@ the per-GPU footprint.
 
 ### Measured (1x H20 96GB, BF16)
 
-- Python 3.12, vLLM 0.30.0, torch 2.13.0+cu130, CUDA 13.0 (forward-compatibility package on
-  an R535 driver), `sensenova/SenseNova-U1-A3B-MoT`, seed 42, CFG scale 4.0
-- Weight loading takes 72.2 GiB and ~13 s; each timing is a second run, so the Triton and
-  compile caches are warm
-- Peak GPU memory is the reserved high-water mark the runner records for the request
+Fixed case used for the stage split and the torch.profiler kernel table:
+
+- Prompt: `Close portrait of an elderly woman by a farmhouse window, warm natural light.`
+- 1024x1024, 50 Euler steps, think off, seed 42, `cfg_scale` 4.0, `cfg_norm` none,
+  `timestep_shift` 3.0, `t_eps` 0.02
+- Python 3.12, vLLM 0.30.0, torch 2.13.0+cu130
+- Peak GPU memory is the reserved high-water mark the runner records (`peak_memory_mb`)
+
+| | Time | Memory |
+| --- | --- | --- |
+| Weights after load | ~13 s | 72.2 GiB |
+| Pipeline `forward` | 7.68 s | 72.9 GiB peak |
+
+`--enable-diffusion-pipeline-profiler` on that request:
+
+| Stage | Time | Share |
+| --- | --- | --- |
+| Text prefix (`_t2i_prefix_forward`, understanding tower) | 0.06 s | 0.7% |
+| Denoising loop (`_run_denoising_loop`, generation tower, 50 steps) | 7.56 s | 98.5% |
+| Pipeline `forward` | 7.68 s | 100% |
+
+There is no VAE. The loop ends in unpatchify / denorm / PIL, which is inside the denoise
+row and is a few tens of milliseconds at 1024x1024.
+
+A warm 8-step generate at the same resolution, wrapped in `torch.profiler` after one
+unprofiled warmup request, spent 1.19 s of self-CUDA time as:
+
+| Kernel family | Self CUDA | Share | What it is |
+| --- | --- | --- | --- |
+| `fused_moe_kernel` | 576 ms | 48% | top-8 expert GEMMs on the 32-expert generation tower |
+| FlashAttention `flash_fwd_kernel` | 222 ms | 19% | dual-tower attention |
+| `nvjet` GEMMs | ~233 ms | 20% | `qkv_proj` / `o_proj` (and the small dense leftovers) |
+| `qk_norm_rope_kernel` | 58 ms | 5% | fused RMSNorm + RoPE |
+| MoE routing / `act_and_mul` / elementwise | ~40 ms | 3% | top-k, SwiGLU, residual |
+
+So a denoise step is about half FusedMoE and about two-fifths attention + dense GEMM.
+`--cfg-parallel-size 2` on the same 8-step t2i request (2-branch `cond`+`uncond`)
+is 0.95 s vs 1.48 s on one GPU (~1.56x). Img2img CFG-P=2 also completes for both
+branch counts at 8-step 1024x1024: 2-way (`img_cfg_scale=1`, `cond`+`img_cond`)
+1.09 s; 3-way (`cfg_scale=4`, `img_cfg_scale=2`, `cond`+`img_cond`+`uncond`)
+1.74 s (3 branches on 2 ranks dispatch as `[[0, 2], [1]]`). Cache-DiT and
+layerwise CPU offload do not take effect on A3B; see
+[diffusion features](../../docs/user_guide/diffusion_features.md) note 8.
+
+Other configurations on the same machine (second run, warm kernels):
 
 | Case | Total | Peak GPU memory |
 | --- | --- | --- |
-| text2img 1024x1024, 50 steps, think off | 7.75 s | 72.9 GiB |
 | text2img 1024x1024, 50 steps, think on | 9.16 s | 73.0 GiB |
 | text2img 1024x1024, 50 steps, think off, TP=2 | 5.64 s | 36.7 GiB per GPU |
 | img2img 2048x2048 output, 25 steps, think off | 20.93 s | 74.6 GiB |
 
-`--enable-diffusion-pipeline-profiler` logs the stage split below. There is no VAE: the
-denoising loop ends in unpatchify, denormalization and PIL conversion, timed on their own
-in the post-processing row.
-
-| Stage | text2img, think off | text2img, think on | img2img |
-| --- | --- | --- | --- |
-| Text prefix through the understanding tower | 0.13 s | 0.06 s | 0.23 s |
-| Think decode, 215 tokens | — | 1.37 s | — |
-| Denoising loop through the generation tower | 7.61 s | 7.66 s | 20.62 s |
-| Of which post-processing | 0.02 s | 0.02 s | 0.11 s |
-| Pipeline forward | 7.74 s | 9.15 s | 20.93 s |
-
-With think on, the conditional prefix runs inline before the decode rather than through
-`_t2i_prefix_forward`, so the prefix row holds the unconditional pass only; the conditional
-one is in the 0.06 s the listed stages leave unaccounted, matching its 0.06 s with think
-off. The img2img prefix includes the 1024 reference-image tokens. The pipeline generated
-that edit at 2048x2048 from a 1024x1024 input, which is why its per-step cost is higher. At
-the same seed TP=2 differs from TP=1 only numerically (MAE 2.97/255, identical composition)
-from the changed reduction order.
+Think-on spends 1.37 s in `_generate_think` (215 tokens). At the same seed TP=2 differs
+from TP=1 only numerically (MAE 2.97/255, identical composition) from the changed
+reduction order.
 
 ```bash
 python examples/offline_inference/text_to_image/text_to_image.py \
