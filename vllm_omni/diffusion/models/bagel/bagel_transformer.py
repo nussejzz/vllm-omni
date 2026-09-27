@@ -432,16 +432,8 @@ class BaseNavitOutputWithPast(ModelOutput):
 
 
 def sp_replicated_phases_run_locally(parallel_config: DiffusionParallelConfig | None) -> bool:
-    """Whether BAGEL's replicated phases must bypass the sequence-parallel strategy.
-
-    The causal text prefill, the ViT/VAE cache updates and the CFG cache-update
-    forward all run on sequences that every SP rank holds in full. Handing them
-    to a strategy is wrong for every strategy we have: AllGather-KV rejects the
-    causal layer and would gather one copy of K/V per rank, and Ulysses/Ring
-    all-to-all the identical per-rank copies as if they were shards (a causal
-    prefill then attends across copies, a cache update sees its K/V duplicated
-    world_size times). So any sequence parallelism at all means "run locally".
-    """
+    """Run replicated prefill and cache-update phases locally under any sequence
+    parallelism to avoid duplicate K/V and incorrect cross-rank attention."""
     if parallel_config is None:
         return False
     if getattr(parallel_config, "allgather_degree", 1) > 1:
