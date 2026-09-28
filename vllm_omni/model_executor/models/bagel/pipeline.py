@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """BAGEL-7B-MoT pipeline topologies (frozen).
 
 Two-stage (default):
@@ -42,6 +42,7 @@ BAGEL_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             model_arch="OmniBagelForConditionalGeneration",
             engine_output_type="text",
+            prompt_transform_func=f"{_PROC}.frame_prompt",
             prompt_expand_func=f"{_PROC}.expand_cfg_prompts",
             omni_kv_config={
                 "need_send_cache": True,
@@ -79,6 +80,7 @@ BAGEL_THINK_PIPELINE = PipelineConfig(
             requires_multimodal_data=True,
             model_arch="OmniBagelForConditionalGeneration",
             engine_output_type="text",
+            prompt_transform_func=f"{_PROC}.frame_prompt",
             prompt_expand_func=f"{_PROC}.expand_cfg_prompts_think",
             omni_kv_config={"need_send_cache": True},
             sampling_constraints={"detokenize": True},
