@@ -1974,16 +1974,6 @@ class Bagel(CFGParallelMixin, nn.Module):
         remain sequence-local. The latent is gathered only once for VAE decode.
         """
 
-        def split_branch(position_ids: torch.Tensor):
-            return self._split_vae_for_sp(
-                x_t,
-                packed_vae_position_ids,
-                packed_vae_token_indexes,
-                packed_text_indexes,
-                packed_seqlens,
-                position_ids,
-            )
-
         (
             local_x_t,
             local_vae_pos_ids,
@@ -1991,19 +1981,35 @@ class Bagel(CFGParallelMixin, nn.Module):
             local_text_indexes,
             local_seqlens,
             local_position_ids,
-        ) = split_branch(packed_position_ids)
+        ) = self._split_vae_for_sp(
+            x_t,
+            packed_vae_position_ids,
+            packed_vae_token_indexes,
+            packed_text_indexes,
+            packed_seqlens,
+            packed_position_ids,
+        )
+
+        local_vae_start = get_sequence_parallel_rank() * local_x_t.shape[0]
+        local_vae_end = local_vae_start + local_x_t.shape[0]
+
+        def split_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(local_position_ids)
+            result[local_text_indexes] = position_ids[packed_text_indexes]
+            result[local_vae_indexes] = position_ids[packed_vae_token_indexes[local_vae_start:local_vae_end]]
+            return result
 
         cfg_text_position_ids = None
         if cfg_text_scale > 1.0:
             if cfg_text_packed_position_ids is None or cfg_text_past_key_values is None:
                 raise ValueError("Text CFG inputs are required when cfg_text_scale > 1.")
-            cfg_text_position_ids = split_branch(cfg_text_packed_position_ids)[-1]
+            cfg_text_position_ids = split_position_ids(cfg_text_packed_position_ids)
 
         cfg_img_position_ids = None
         if cfg_img_scale > 1.0:
             if cfg_img_packed_position_ids is None or cfg_img_past_key_values is None:
                 raise ValueError("Image CFG inputs are required when cfg_img_scale > 1.")
-            cfg_img_position_ids = split_branch(cfg_img_packed_position_ids)[-1]
+            cfg_img_position_ids = split_position_ids(cfg_img_packed_position_ids)
 
         for i, t_value in enumerate(timesteps.tolist()):
             local_timestep = timesteps[i].expand(local_x_t.shape[0])
