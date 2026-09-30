@@ -1493,16 +1493,11 @@ class Bagel(CFGParallelMixin, nn.Module):
         sp_size = self._sp_size
         sp_rank = get_sequence_parallel_rank()
         num_vae = x_t.shape[0]
-        if (
-            self.parallel_config is not None
-            and self.parallel_config.allgather_degree > 1
-            and num_vae % self.parallel_config.allgather_degree != 0
-        ):
+        if num_vae % sp_size != 0:
             raise ValueError(
-                f"BAGEL AllGather-KV requires VAE token count ({num_vae}) to be divisible by "
-                f"allgather_degree ({self.parallel_config.allgather_degree})."
+                f"BAGEL sequence parallelism requires VAE token count ({num_vae}) "
+                f"to be divisible by SP size ({sp_size})."
             )
-        assert num_vae % sp_size == 0, f"VAE token count {num_vae} not divisible by SP size {sp_size}"
         chunk = num_vae // sp_size
         start = sp_rank * chunk
         end = start + chunk
