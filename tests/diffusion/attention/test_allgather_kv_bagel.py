@@ -206,7 +206,7 @@ def test_persistent_shard_gathers_only_the_final_latent() -> None:
             torch.arange(local_size),
         )
 
-    def _forward_single_branch_local(local_x_t, *args):
+    def _forward_denoise_branch_local(local_x_t, *args):
         del args
         calls["forward"] += 1
         return torch.ones_like(local_x_t)
@@ -216,7 +216,7 @@ def test_persistent_shard_gathers_only_the_final_latent() -> None:
         return torch.cat((local_x_t, local_x_t))
 
     model._split_vae_for_sp = _split_vae_for_sp
-    model._forward_single_branch_local = _forward_single_branch_local
+    model._forward_denoise_branch_local = _forward_denoise_branch_local
     model._gather_vae_for_sp = _gather_vae_for_sp
 
     result, trajectories, trajectory_timesteps, log_probs = Bagel._generate_image_allgather_kv(

@@ -2013,7 +2013,7 @@ class Bagel(CFGParallelMixin, nn.Module):
 
         for i, t_value in enumerate(timesteps.tolist()):
             local_timestep = timesteps[i].expand(local_x_t.shape[0])
-            v_t = self._forward_single_branch_local(
+            v_t = self._forward_denoise_branch_local(
                 local_x_t,
                 local_timestep,
                 local_vae_pos_ids,
@@ -2029,7 +2029,7 @@ class Bagel(CFGParallelMixin, nn.Module):
             cfg_text_scale_i = cfg_text_scale if in_cfg_window else 1.0
             cfg_img_scale_i = cfg_img_scale if in_cfg_window else 1.0
             if cfg_text_scale_i > 1.0:
-                cfg_text_v_t = self._forward_single_branch_local(
+                cfg_text_v_t = self._forward_denoise_branch_local(
                     local_x_t,
                     local_timestep,
                     local_vae_pos_ids,
@@ -2042,7 +2042,7 @@ class Bagel(CFGParallelMixin, nn.Module):
                 )
                 cfg_img_v_t = None
                 if cfg_img_scale_i > 1.0:
-                    cfg_img_v_t = self._forward_single_branch_local(
+                    cfg_img_v_t = self._forward_denoise_branch_local(
                         local_x_t,
                         local_timestep,
                         local_vae_pos_ids,
@@ -2653,7 +2653,7 @@ class Bagel(CFGParallelMixin, nn.Module):
             true_cfg_scale["cfg_renorm_min"],
         )
 
-    def _forward_single_branch_local(
+    def _forward_denoise_branch_local(
         self,
         local_x_t: torch.Tensor,
         timestep: torch.Tensor,
@@ -2665,7 +2665,7 @@ class Bagel(CFGParallelMixin, nn.Module):
         packed_text_ids: torch.Tensor,
         past_key_values: NaiveCache,
     ) -> torch.Tensor:
-        """Run all transformer blocks while keeping the sequence shard local."""
+        """Predict the local velocity for one conditioning branch without gathering."""
         packed_text_embedding = self.language_model.forward(
             packed_text_ids=packed_text_ids,
             return_embeddings_only=True,
@@ -2735,7 +2735,7 @@ class Bagel(CFGParallelMixin, nn.Module):
                 packed_position_ids,
             )
 
-            local_v_t = self._forward_single_branch_local(
+            local_v_t = self._forward_denoise_branch_local(
                 local_x_t=local_x_t,
                 timestep=timestep[: local_x_t.shape[0]],
                 local_vae_pos_ids=local_vae_pos_ids,
