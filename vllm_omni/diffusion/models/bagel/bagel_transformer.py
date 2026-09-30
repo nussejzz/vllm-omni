@@ -499,18 +499,10 @@ class PackedAttentionMoT(nn.Module):
 
         self.rotary_op = RotaryEmbedding(is_neox_style=True)
 
-        # Prefill-time attention (text / ViT / VAE cache updates, understanding)
-        # sees the full sequence replicated on every SP rank. Ulysses splits
-        # heads and keeps the full sequence, so those phases stay correct under
-        # it. AllGather-KV would gather one copy of K/V per rank and rejects a
-        # causal layer outright, so under AllGather-KV the replicated phases run
-        # their kernel locally; only the sharded denoising path uses the strategy.
-        # Ulysses/Ring have the same problem in a different guise: every rank
-        # holds an identical copy of a replicated sequence, and the all-to-all
-        # would splice those copies together as if they were shards (a causal
-        # text prefill then leaks across copies, a cache update sees its K/V
-        # duplicated world_size times). So every SP strategy runs the
-        # replicated phases locally.
+        # Prefill and cache-update inputs are replicated on every SP rank.
+        # Applying an SP strategy would treat those replicas as sequence shards,
+        # duplicating or mixing K/V across ranks. Run these phases locally; only
+        # sharded denoising uses sequence-parallel attention.
         replicated_local = sp_replicated_phases_run_locally(parallel_config)
         self.attn_causal = DiffusionAttention(
             num_heads=self.total_num_heads,
