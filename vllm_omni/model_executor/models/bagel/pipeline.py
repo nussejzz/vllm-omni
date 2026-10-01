@@ -36,7 +36,7 @@ BAGEL_CHAT_TEMPLATE = (
     "{%- else -%}"
     "{%- for content in message['content'] -%}"
     "{%- if content['type'] in ('image', 'image_url') -%}"
-    "{{- '<|vision_start|><|image_pad|><|vision_end|>' -}}"
+    "{{- '<|image_pad|>' -}}"
     "{%- endif -%}"
     "{%- endfor -%}"
     "{%- for content in message['content'] -%}"

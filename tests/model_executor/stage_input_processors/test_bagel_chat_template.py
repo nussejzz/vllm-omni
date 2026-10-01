@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """The two-stage BAGEL pipeline must render chat requests like the reference inferencer.
 
-``interleave_inference`` builds the context segment by segment: an image is
-``<|vision_start|>`` + ViT tokens + ``<|vision_end|>``, a text is
-``<|im_start|>`` + text + ``<|im_end|>``, and text generation starts from a
-fresh ``<|im_start|>``. There are no role names and no system prompt, so the
-tokenizer's Qwen chat template must not be used for this model.
+``interleave_inference`` builds the context segment by segment: an image
+block first, then each text as ``<|im_start|>`` + text + ``<|im_end|>``, and
+text generation starts from a fresh ``<|im_start|>``. There are no role names
+and no system prompt, so the tokenizer's Qwen chat template must not be used
+for this model. The image placeholder expands to the whole image block
+(``<|vision_start|>`` + ViT tokens + ``<|vision_end|>``) in the AR model.
 """
 
 from __future__ import annotations
@@ -28,8 +29,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 BOS = "<|im_start|>"
 EOS = "<|im_end|>"
-IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
-SPECIAL_TOKENS = (BOS, EOS, "<|vision_start|>", "<|vision_end|>", "<|image_pad|>")
+IMAGE = "<|image_pad|>"
+SPECIAL_TOKENS = (BOS, EOS, IMAGE)
 QUESTION = "What is the capital of France?"
 DESCRIBE = "Describe this image in detail."
 
@@ -74,19 +75,11 @@ def test_string_content_is_framed_the_same_way():
     [{"type": "image"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}],
     ids=["image", "image_url"],
 )
-def test_image_comes_first_with_vision_markers(image_part: dict):
+def test_image_placeholder_comes_before_the_text(image_part: dict):
     rendered = _render([_user(_text(DESCRIBE), image_part)])
 
     assert rendered == f"{IMAGE}{BOS}{DESCRIBE}{EOS}{BOS}"
-    assert _tokens(rendered) == [
-        "<|vision_start|>",
-        "<|image_pad|>",
-        "<|vision_end|>",
-        BOS,
-        *DESCRIBE.split(),
-        EOS,
-        BOS,
-    ]
+    assert _tokens(rendered) == [IMAGE, BOS, *DESCRIBE.split(), EOS, BOS]
 
 
 def test_every_message_is_a_framed_segment_without_roles():
