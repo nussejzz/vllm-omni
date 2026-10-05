@@ -38,7 +38,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
-from vllm_omni.diffusion.attention.layer import PREFER_SDPA_KERNEL
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     ALLGATHER_KV_PRE_GATHERED,
@@ -432,16 +431,8 @@ class BaseNavitOutputWithPast(ModelOutput):
 
 
 def sp_replicated_phases_run_locally(parallel_config: DiffusionParallelConfig | None) -> bool:
-    """Whether BAGEL's replicated phases must bypass the sequence-parallel strategy.
-
-    The causal text prefill, the ViT/VAE cache updates and the CFG cache-update
-    forward all run on sequences that every SP rank holds in full. Handing them
-    to a strategy is wrong for every strategy we have: AllGather-KV rejects the
-    causal layer and would gather one copy of K/V per rank, and Ulysses/Ring
-    all-to-all the identical per-rank copies as if they were shards (a causal
-    prefill then attends across copies, a cache update sees its K/V duplicated
-    world_size times). So any sequence parallelism at all means "run locally".
-    """
+    """Run replicated prefill and cache-update phases locally under any sequence
+    parallelism to avoid duplicate K/V and incorrect cross-rank attention."""
     if parallel_config is None:
         return False
     if getattr(parallel_config, "allgather_degree", 1) > 1:
@@ -507,18 +498,10 @@ class PackedAttentionMoT(nn.Module):
 
         self.rotary_op = RotaryEmbedding(is_neox_style=True)
 
-        # Prefill-time attention (text / ViT / VAE cache updates, understanding)
-        # sees the full sequence replicated on every SP rank. Ulysses splits
-        # heads and keeps the full sequence, so those phases stay correct under
-        # it. AllGather-KV would gather one copy of K/V per rank and rejects a
-        # causal layer outright, so under AllGather-KV the replicated phases run
-        # their kernel locally; only the sharded denoising path uses the strategy.
-        # Ulysses/Ring have the same problem in a different guise: every rank
-        # holds an identical copy of a replicated sequence, and the all-to-all
-        # would splice those copies together as if they were shards (a causal
-        # text prefill then leaks across copies, a cache update sees its K/V
-        # duplicated world_size times). So every SP strategy runs the
-        # replicated phases locally.
+        # Prefill and cache-update inputs are replicated on every SP rank.
+        # Applying an SP strategy would treat those replicas as sequence shards,
+        # duplicating or mixing K/V across ranks. Run these phases locally; only
+        # sharded denoising uses sequence-parallel attention.
         replicated_local = sp_replicated_phases_run_locally(parallel_config)
         self.attn_causal = DiffusionAttention(
             num_heads=self.total_num_heads,
@@ -623,9 +606,7 @@ class PackedAttentionMoT(nn.Module):
                 joint_key=ctx_k.unsqueeze(0),
                 joint_value=ctx_v.unsqueeze(0),
                 joint_strategy="front",
-                # K/V are already gathered above; SDPA keeps the denoise
-                # trajectory aligned with the sequence-parallel reference.
-                extra={ALLGATHER_KV_PRE_GATHERED: True, PREFER_SDPA_KERNEL: True},
+                extra={ALLGATHER_KV_PRE_GATHERED: True},
             ),
         ).squeeze(0)
 
@@ -1501,16 +1482,11 @@ class Bagel(CFGParallelMixin, nn.Module):
         sp_size = self._sp_size
         sp_rank = get_sequence_parallel_rank()
         num_vae = x_t.shape[0]
-        if (
-            self.parallel_config is not None
-            and self.parallel_config.allgather_degree > 1
-            and num_vae % self.parallel_config.allgather_degree != 0
-        ):
+        if num_vae % sp_size != 0:
             raise ValueError(
-                f"BAGEL AllGather-KV requires VAE token count ({num_vae}) to be divisible by "
-                f"allgather_degree ({self.parallel_config.allgather_degree})."
+                f"BAGEL sequence parallelism requires VAE token count ({num_vae}) "
+                f"to be divisible by SP size ({sp_size})."
             )
-        assert num_vae % sp_size == 0, f"VAE token count {num_vae} not divisible by SP size {sp_size}"
         chunk = num_vae // sp_size
         start = sp_rank * chunk
         end = start + chunk
@@ -1987,16 +1963,6 @@ class Bagel(CFGParallelMixin, nn.Module):
         remain sequence-local. The latent is gathered only once for VAE decode.
         """
 
-        def split_branch(position_ids: torch.Tensor):
-            return self._split_vae_for_sp(
-                x_t,
-                packed_vae_position_ids,
-                packed_vae_token_indexes,
-                packed_text_indexes,
-                packed_seqlens,
-                position_ids,
-            )
-
         (
             local_x_t,
             local_vae_pos_ids,
@@ -2004,23 +1970,39 @@ class Bagel(CFGParallelMixin, nn.Module):
             local_text_indexes,
             local_seqlens,
             local_position_ids,
-        ) = split_branch(packed_position_ids)
+        ) = self._split_vae_for_sp(
+            x_t,
+            packed_vae_position_ids,
+            packed_vae_token_indexes,
+            packed_text_indexes,
+            packed_seqlens,
+            packed_position_ids,
+        )
+
+        local_vae_start = get_sequence_parallel_rank() * local_x_t.shape[0]
+        local_vae_end = local_vae_start + local_x_t.shape[0]
+
+        def split_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(local_position_ids)
+            result[local_text_indexes] = position_ids[packed_text_indexes]
+            result[local_vae_indexes] = position_ids[packed_vae_token_indexes[local_vae_start:local_vae_end]]
+            return result
 
         cfg_text_position_ids = None
         if cfg_text_scale > 1.0:
             if cfg_text_packed_position_ids is None or cfg_text_past_key_values is None:
                 raise ValueError("Text CFG inputs are required when cfg_text_scale > 1.")
-            cfg_text_position_ids = split_branch(cfg_text_packed_position_ids)[-1]
+            cfg_text_position_ids = split_position_ids(cfg_text_packed_position_ids)
 
         cfg_img_position_ids = None
         if cfg_img_scale > 1.0:
             if cfg_img_packed_position_ids is None or cfg_img_past_key_values is None:
                 raise ValueError("Image CFG inputs are required when cfg_img_scale > 1.")
-            cfg_img_position_ids = split_branch(cfg_img_packed_position_ids)[-1]
+            cfg_img_position_ids = split_position_ids(cfg_img_packed_position_ids)
 
         for i, t_value in enumerate(timesteps.tolist()):
             local_timestep = timesteps[i].expand(local_x_t.shape[0])
-            v_t = self._forward_single_branch_local(
+            v_t = self._forward_denoise_branch_local(
                 local_x_t,
                 local_timestep,
                 local_vae_pos_ids,
@@ -2036,7 +2018,7 @@ class Bagel(CFGParallelMixin, nn.Module):
             cfg_text_scale_i = cfg_text_scale if in_cfg_window else 1.0
             cfg_img_scale_i = cfg_img_scale if in_cfg_window else 1.0
             if cfg_text_scale_i > 1.0:
-                cfg_text_v_t = self._forward_single_branch_local(
+                cfg_text_v_t = self._forward_denoise_branch_local(
                     local_x_t,
                     local_timestep,
                     local_vae_pos_ids,
@@ -2049,7 +2031,7 @@ class Bagel(CFGParallelMixin, nn.Module):
                 )
                 cfg_img_v_t = None
                 if cfg_img_scale_i > 1.0:
-                    cfg_img_v_t = self._forward_single_branch_local(
+                    cfg_img_v_t = self._forward_denoise_branch_local(
                         local_x_t,
                         local_timestep,
                         local_vae_pos_ids,
@@ -2660,7 +2642,7 @@ class Bagel(CFGParallelMixin, nn.Module):
             true_cfg_scale["cfg_renorm_min"],
         )
 
-    def _forward_single_branch_local(
+    def _forward_denoise_branch_local(
         self,
         local_x_t: torch.Tensor,
         timestep: torch.Tensor,
@@ -2672,7 +2654,7 @@ class Bagel(CFGParallelMixin, nn.Module):
         packed_text_ids: torch.Tensor,
         past_key_values: NaiveCache,
     ) -> torch.Tensor:
-        """Run all transformer blocks while keeping the sequence shard local."""
+        """Predict the local velocity for one conditioning branch without gathering."""
         packed_text_embedding = self.language_model.forward(
             packed_text_ids=packed_text_ids,
             return_embeddings_only=True,
@@ -2742,7 +2724,7 @@ class Bagel(CFGParallelMixin, nn.Module):
                 packed_position_ids,
             )
 
-            local_v_t = self._forward_single_branch_local(
+            local_v_t = self._forward_denoise_branch_local(
                 local_x_t=local_x_t,
                 timestep=timestep[: local_x_t.shape[0]],
                 local_vae_pos_ids=local_vae_pos_ids,
