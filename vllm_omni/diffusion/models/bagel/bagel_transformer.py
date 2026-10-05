@@ -38,7 +38,6 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.transformers_utils.configs.bagel import BagelConfig
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
-from vllm_omni.diffusion.attention.layer import PREFER_SDPA_KERNEL
 from vllm_omni.diffusion.attention.layer import Attention as DiffusionAttention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     ALLGATHER_KV_PRE_GATHERED,
@@ -607,9 +606,7 @@ class PackedAttentionMoT(nn.Module):
                 joint_key=ctx_k.unsqueeze(0),
                 joint_value=ctx_v.unsqueeze(0),
                 joint_strategy="front",
-                # K/V are already gathered above; SDPA keeps the denoise
-                # trajectory aligned with the sequence-parallel reference.
-                extra={ALLGATHER_KV_PRE_GATHERED: True, PREFER_SDPA_KERNEL: True},
+                extra={ALLGATHER_KV_PRE_GATHERED: True},
             ),
         ).squeeze(0)
 

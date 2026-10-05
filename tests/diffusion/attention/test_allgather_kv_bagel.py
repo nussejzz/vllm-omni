@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
-from vllm_omni.diffusion.attention.layer import PREFER_SDPA_KERNEL, Attention
+from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     ALLGATHER_KV_PRE_GATHERED,
     AllGatherKVParallelAttention,
@@ -261,25 +261,6 @@ def test_skip_sequence_parallel_layer_does_not_build_a_strategy(monkeypatch: pyt
     assert attn.parallel_strategy is attn._no_parallel_strategy
     with pytest.raises(AssertionError, match="factory must not run"):
         Attention(num_heads=4, head_size=8, softmax_scale=0.5, causal=True)
-
-
-def test_prefer_sdpa_kernel_routes_one_call_to_the_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    attn = Attention(num_heads=2, head_size=8, softmax_scale=0.5, causal=False)
-    if attn.sdpa_fallback is None or attn.backend_explicit:
-        pytest.skip("layer has no SDPA compatibility kernel on this platform")
-    seen: dict[str, object] = {}
-    monkeypatch.setattr(attn.sdpa_fallback, "forward", lambda q, k, v, m: seen.setdefault("sdpa", m) or q)
-    monkeypatch.setattr(attn.attention, "forward", lambda q, k, v, m: seen.setdefault("backend", m) or q)
-    q = k = v = torch.zeros(1, 4, 2, 8)
-
-    attn._run_local_attention(q, k, v, AttentionMetadata(extra={PREFER_SDPA_KERNEL: True, "keep": 1}))
-    assert "sdpa" in seen and "backend" not in seen
-    # The routing key is consumed; other extra keys reach the kernel untouched.
-    assert seen["sdpa"].extra == {"keep": 1}
-
-    seen.clear()
-    attn._run_local_attention(q, k, v, AttentionMetadata())
-    assert "backend" in seen and "sdpa" not in seen
 
 
 @pytest.mark.parametrize(
