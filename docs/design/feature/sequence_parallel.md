@@ -114,13 +114,6 @@ built with `skip_sequence_parallel=True` and run locally, which also keeps the
 strategy's non-causal requirement away from BAGEL's causal prefill layer. A
 layer that opts out of SP never asks the factory for a strategy.
 
-The BAGEL AllGather-KV denoising path pins the SDPA kernel for numerical
-alignment by setting `AttentionMetadata.extra[PREFER_SDPA_KERNEL]` on that
-call (a user-explicit backend still wins). Although dense FlashAttention
-accepts asymmetric Q/K lengths, its small reduction-order differences compound
-across the denoise trajectory. A stable Flash kernel for this shape remains
-follow-up work.
-
 AllGather-KV requires equal unmasked sequence shards and is mutually exclusive
 with Ulysses/Ring. Full K/V must fit on every rank.
 
