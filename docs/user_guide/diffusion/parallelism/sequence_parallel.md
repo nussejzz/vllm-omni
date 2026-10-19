@@ -1,6 +1,5 @@
 # Sequence Parallelism Guide
 
-
 ## Table of Content
 
 - [Overview](#overview)
@@ -91,6 +90,7 @@ omni = Omni(
 ```python
 omni = Omni(
     model="ByteDance-Seed/BAGEL-7B-MoT",
+    deploy_config="vllm_omni/deploy/bagel_allgather_kv4.yaml",
     parallel_config=DiffusionParallelConfig(allgather_degree=4),
 )
 ```
@@ -102,13 +102,17 @@ Ulysses is `P / (R + 1)` (ignoring collective implementation overhead). BAGEL
 has `R=7`, so `allgather_degree=4` communicates half as many bytes as
 Ulysses-SP 4.
 
-BAGEL launches asynchronous K/V All-Gathers between independent K, V, and Q
-projections, so the communication can be fully hidden when the V/Q projection
-window covers the collective latency, and keeps the latent shard local across
-the denoising loop (gathered once for VAE decode). Full K/V must fit on each
-rank, sequence shards must be equal and unmasked, and quantized QKV projections
-must expose independent projection slices to use the overlap path. A ready-made
-recipe is `vllm_omni/deploy/bagel_allgather_kv4.yaml`.
+BAGEL's complete-request `generate_image` path launches asynchronous K/V
+All-Gathers between independent K, V, and Q projections, so the communication
+can be fully hidden when the V/Q projection window covers the collective
+latency. When `step_execution=False`, `cfg_parallel_size=1`, and no custom
+scheduler, trajectory collection, or frame conditioning is requested, it also
+keeps the latent shard local across the denoising loop and gathers once for VAE
+decode. Stepwise `denoise_step` and CFG-parallel execution still gather the
+latent every step. Full K/V must fit on each rank, sequence shards must be equal
+and unmasked, and quantized QKV projections must expose independent projection
+slices to use the overlap path. A ready-made recipe is
+`vllm_omni/deploy/bagel_allgather_kv4.yaml`.
 
 ---
 
@@ -181,7 +185,8 @@ vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --ring 2
 **AllGather-KV:**
 
 ```bash
-vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --allgather-degree 4
+vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/bagel_allgather_kv4.yaml
 ```
 
 ---
@@ -191,7 +196,7 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 --allgather-degree 4
 In `DiffusionParallelConfig`:
 
 | Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
+| ----------- | ------ | --------- | ------------- |
 | `ulysses_degree` | int | 1 | Number of GPUs for Ulysses-SP. Uses all-to-all communication. |
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
 | `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV. Q remains local; K/V are all-gathered per layer. Mutually exclusive with Ulysses/Ring. |
@@ -199,11 +204,11 @@ In `DiffusionParallelConfig`:
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
+
 - Total sequence parallel size equals `ulysses_degree × ring_degree`, or `allgather_degree` when AllGather-KV is enabled
 - `allgather_degree > 1` requires `ulysses_degree=1` and `ring_degree=1`
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
-
 
 ## Best Practices
 
@@ -218,7 +223,6 @@ In `DiffusionParallelConfig`:
 
 - Small images (<1024px) - overhead exceeds benefit, use single GPU with cache instead
 
-
 ---
 
 ## Troubleshooting
@@ -228,6 +232,7 @@ In `DiffusionParallelConfig`:
 **Symptoms**: Adding GPUs doesn't improve speed proportionally, or higher parallelism degree is slower
 
 **Diagnosis:**
+
 ```bash
 # Check GPU topology
 nvidia-smi topo -m
@@ -238,15 +243,16 @@ nvidia-smi topo -m
 
 1. Check inter-GPU communication - NVLink is better than PCIe
 2. Reduce parallelism degree if over-parallelized:
+
 ```python
 # If 4 GPUs is slower than 2
 parallel_config=DiffusionParallelConfig(ulysses_degree=2)
 ```
-3. Try to switch between Ring-Attention and Ulysses-SP
+
+1. Try to switch between Ring-Attention and Ulysses-SP
 
 - Ring-Attention has advantages, like communication-computation overlap, but the block-wise loop overhead is relatively higher, especially for short sequences
 - Ulysses-SP: can benefit from larger bandwidth (such as NVLink), with two major constraints, the sequence length should be divisible by usp size, and the number of heads should be divisible by usp size (or use `ulysses_mode="advanced_uaa"`)
-
 
 ### Common Issue 2: Out of Memory (OOM)
 
@@ -255,11 +261,12 @@ parallel_config=DiffusionParallelConfig(ulysses_degree=2)
 **Solutions:**
 
 1. Increase parallelism degree to split sequence more:
+
 ```python
 parallel_config=DiffusionParallelConfig(ulysses_degree=4)  # From 2
 ```
-2. Combine with other parallelism method, e.g., tensor parallel, and memory optimization methods, e.g., cpu offloading.
 
+1. Combine with other parallelism method, e.g., tensor parallel, and memory optimization methods, e.g., cpu offloading.
 
 ## Summary
 

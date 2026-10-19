@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import vllm_omni.diffusion.models.bagel.bagel_transformer as bagel_transformer
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.parallel.allgather_kv import (
@@ -14,8 +15,15 @@ from vllm_omni.diffusion.attention.parallel.allgather_kv import (
     AllGatherKVParallelAttention,
     async_all_gather_sequence,
 )
-from vllm_omni.diffusion.models.bagel.bagel_transformer import Bagel, sp_replicated_phases_run_locally
+from vllm_omni.diffusion.models.bagel.bagel_transformer import (
+    Bagel,
+    PackedAttentionMoT,
+    sp_replicated_phases_run_locally,
+)
+from vllm_omni.diffusion.models.bagel.mot.mot_layernorm import MoTRMSNorm
 from vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
+
+pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
 
 class _CompletedWork:
@@ -38,7 +46,12 @@ class _MockSPGroup:
         return torch.cat([tensor + 10 * r for r in range(self.allgather_world_size)], dim=dim)
 
 
-def test_async_all_gather_sequence_concatenates_on_sequence(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(("batch_size", "shares_storage"), [(1, True), (2, False)])
+def test_async_all_gather_sequence_concatenates_on_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+    shares_storage: bool,
+) -> None:
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
 
     def _all_gather_into_tensor(output, tensor, *, group, async_op):
@@ -49,14 +62,17 @@ def test_async_all_gather_sequence_concatenates_on_sequence(monkeypatch: pytest.
         return _CompletedWork()
 
     monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", _all_gather_into_tensor)
-    local = torch.randn(1, 3, 4, 8)
+    local = torch.randn(batch_size, 3, 4, 8)
 
-    gathered = async_all_gather_sequence(local, object()).wait()
+    pending = async_all_gather_sequence(local, object())
+    gathered = pending.wait()
 
     # Same layout as SequenceParallelGroupCoordinator.all_gather(dim=1): rank 0, then rank 1.
-    assert gathered.shape == (1, 6, 4, 8)
+    assert gathered.shape == (batch_size, 6, 4, 8)
     assert torch.equal(gathered[:, :3], local)
     assert torch.equal(gathered[:, 3:], local + 10)
+    assert gathered.is_contiguous()
+    assert (gathered.data_ptr() == pending.output.data_ptr()) is shares_storage
 
 
 def test_async_all_gather_sequence_rejects_rank_one_tensors() -> None:
@@ -150,6 +166,211 @@ def test_gen_component_projection_rejects_packed_quantized_weights() -> None:
     assert not layer.supports_separate_gen_projection
     with pytest.raises(NotImplementedError):
         layer.forward_gen_component(torch.ones(3, 4), "q")
+
+
+def test_forward_gen_norm_uses_generation_weight() -> None:
+    layer = MoTRMSNorm(4, head_norm=True)
+    with torch.no_grad():
+        layer.weight.fill_(1.0)
+        layer.gen_weight.fill_(2.0)
+    inputs = torch.tensor(
+        [
+            [[1.0, 2.0, 3.0, 4.0]],
+            [[4.0, 3.0, 2.0, 1.0]],
+        ]
+    )
+
+    actual = layer.forward_gen(inputs)
+    variance = inputs.float().square().mean(dim=-1, keepdim=True)
+    expected = inputs * torch.rsqrt(variance + layer.variance_epsilon) * 2.0
+
+    torch.testing.assert_close(actual, expected)
+    assert not torch.allclose(actual, layer.forward_native(inputs))
+
+
+def test_forward_gen_allgather_kv_runs_overlapped_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[str] = []
+    captured_metadata: list[AttentionMetadata] = []
+
+    class _QKVProjection:
+        def forward_gen_component(self, inputs: torch.Tensor, component: str) -> torch.Tensor:
+            events.append(f"project:{component}")
+            width = 4 if component == "q" else 2
+            value = {"k": 1.0, "v": 2.0, "q": 3.0}[component]
+            return torch.full((inputs.shape[0], width), value, dtype=inputs.dtype)
+
+        def __call__(self, inputs: torch.Tensor):
+            events.append("project:text")
+            return torch.zeros((inputs.shape[0], 8), dtype=inputs.dtype), None
+
+    class _Norm:
+        def forward_gen(self, inputs: torch.Tensor) -> torch.Tensor:
+            return inputs
+
+        def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
+            return inputs
+
+    class _OutputProjection:
+        def __call__(self, inputs: torch.Tensor):
+            events.append("project:text_output")
+            return inputs, None
+
+        def forward_gen(self, inputs: torch.Tensor):
+            events.append("project:vae_output")
+            return inputs, None
+
+    def _rotary(inputs: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        del cos, sin
+        return inputs
+
+    def _async_gather(inputs: torch.Tensor, group: object):
+        assert group is process_group
+        name = "k" if torch.all(inputs == 1) else "v"
+        events.append(f"gather:{name}")
+
+        class _Gather:
+            def wait(self) -> torch.Tensor:
+                events.append(f"wait:{name}")
+                return inputs
+
+        return _Gather()
+
+    def _attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        events.append("attention")
+        captured_metadata.append(metadata)
+        assert key.shape == value.shape == (1, 2, 1, 2)
+        return torch.cat((metadata.joint_query, query), dim=1)
+
+    process_group = object()
+    monkeypatch.setattr(bagel_transformer, "get_sp_group", lambda: SimpleNamespace(allgather_group=process_group))
+    monkeypatch.setattr(bagel_transformer, "async_all_gather_sequence", _async_gather)
+    layer = SimpleNamespace(
+        hidden_size=4,
+        head_dim=2,
+        num_heads=2,
+        num_kv_heads=1,
+        q_size=4,
+        kv_size=2,
+        layer_idx=0,
+        qkv_proj=_QKVProjection(),
+        q_norm=_Norm(),
+        k_norm=_Norm(),
+        rotary_op=_rotary,
+        attn_noncausal=_attention,
+        o_proj=_OutputProjection(),
+    )
+
+    output, cache = PackedAttentionMoT._forward_gen_allgather_kv(
+        layer,
+        packed_query_sequence=torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        packed_query_position_embeddings=(torch.ones(3, 2), torch.zeros(3, 2)),
+        past_key_values=None,
+        packed_vae_token_indexes=torch.tensor([1, 2]),
+        packed_text_indexes=torch.tensor([0]),
+    )
+
+    assert output.shape == (3, 4)
+    assert cache is None
+    assert events[:7] == [
+        "project:k",
+        "gather:k",
+        "project:v",
+        "gather:v",
+        "project:q",
+        "project:text",
+        "wait:k",
+    ]
+    assert events[7:9] == ["wait:v", "attention"]
+    assert captured_metadata[0].extra == {ALLGATHER_KV_PRE_GATHERED: True}
+
+
+def test_forward_gen_allgather_kv_drains_inflight_gathers_on_projection_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[str] = []
+
+    class _QKVProjection:
+        def forward_gen_component(self, inputs: torch.Tensor, component: str) -> torch.Tensor:
+            if component == "q":
+                raise RuntimeError("Q projection failed")
+            width = 2
+            value = {"k": 1.0, "v": 2.0}[component]
+            return torch.full((inputs.shape[0], width), value, dtype=inputs.dtype)
+
+    class _Norm:
+        def forward_gen(self, inputs: torch.Tensor) -> torch.Tensor:
+            return inputs
+
+    def _rotary(inputs: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        del cos, sin
+        return inputs
+
+    def _async_gather(inputs: torch.Tensor, group: object):
+        assert group is process_group
+        name = "k" if torch.all(inputs == 1) else "v"
+
+        class _Gather:
+            def wait(self) -> torch.Tensor:
+                waits.append(name)
+                return inputs
+
+        return _Gather()
+
+    process_group = object()
+    monkeypatch.setattr(bagel_transformer, "get_sp_group", lambda: SimpleNamespace(allgather_group=process_group))
+    monkeypatch.setattr(bagel_transformer, "async_all_gather_sequence", _async_gather)
+    layer = SimpleNamespace(
+        head_dim=2,
+        num_heads=2,
+        num_kv_heads=1,
+        qkv_proj=_QKVProjection(),
+        q_norm=_Norm(),
+        k_norm=_Norm(),
+        rotary_op=_rotary,
+    )
+
+    with pytest.raises(RuntimeError, match="Q projection failed"):
+        PackedAttentionMoT._forward_gen_allgather_kv(
+            layer,
+            packed_query_sequence=torch.arange(12, dtype=torch.float32).reshape(3, 4),
+            packed_query_position_embeddings=(torch.ones(3, 2), torch.zeros(3, 2)),
+            past_key_values=None,
+            packed_vae_token_indexes=torch.tensor([1, 2]),
+            packed_text_indexes=torch.tensor([0]),
+        )
+
+    assert waits == ["k", "v"]
+
+
+def test_forward_gen_uses_fused_path_when_separate_projection_is_unsupported() -> None:
+    class _FusedPathReachedError(RuntimeError):
+        pass
+
+    class _FusedOnlyQKV(torch.nn.Module):
+        supports_separate_gen_projection = False
+
+        def forward(self, *args, **kwargs):
+            raise _FusedPathReachedError
+
+    layer = PackedAttentionMoT.__new__(PackedAttentionMoT)
+    torch.nn.Module.__init__(layer)
+    layer.qkv_proj = _FusedOnlyQKV()
+    layer._is_allgather_kv_active = lambda: True
+
+    with pytest.raises(_FusedPathReachedError):
+        layer._forward_gen(
+            packed_query_sequence=torch.zeros(2, 4),
+            query_lens=torch.tensor([2]),
+            packed_query_position_embeddings=(torch.ones(2, 2), torch.zeros(2, 2)),
+            past_key_values=None,
+            packed_vae_token_indexes=torch.tensor([1]),
+            packed_text_indexes=torch.tensor([0]),
+        )
 
 
 def test_global_cfg_renorm_reduces_norms_across_the_allgather_group(monkeypatch: pytest.MonkeyPatch) -> None:

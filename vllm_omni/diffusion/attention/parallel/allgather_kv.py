@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -51,7 +51,6 @@ class AsyncSequenceAllGather:
                 world_size * self.local_seq_len,
                 *self.output.shape[2:],
             )
-            .contiguous()
         )
 
 

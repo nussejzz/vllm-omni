@@ -566,31 +566,44 @@ class PackedAttentionMoT(nn.Module):
         cp_group = get_sp_group().allgather_group
         key_gather = async_all_gather_sequence(vae_k.unsqueeze(0), cp_group)
 
-        vae_v = self.qkv_proj.forward_gen_component(vae_hidden, "v")
-        vae_v = vae_v.view(-1, self.num_kv_heads, self.head_dim).to(torch.bfloat16)
-        value_gather = async_all_gather_sequence(vae_v.unsqueeze(0), cp_group)
+        value_gather = None
+        try:
+            vae_v = self.qkv_proj.forward_gen_component(vae_hidden, "v")
+            vae_v = vae_v.view(-1, self.num_kv_heads, self.head_dim).to(torch.bfloat16)
+            value_gather = async_all_gather_sequence(vae_v.unsqueeze(0), cp_group)
 
-        vae_q = self.qkv_proj.forward_gen_component(vae_hidden, "q")
-        vae_q = vae_q.view(-1, self.num_heads, self.head_dim)
-        vae_q = self.q_norm.forward_gen(vae_q.to(torch.float32))
-        vae_q = self.rotary_op(vae_q.to(vae_cos.dtype).unsqueeze(0), vae_cos, vae_sin).squeeze(0).to(torch.bfloat16)
+            vae_q = self.qkv_proj.forward_gen_component(vae_hidden, "q")
+            vae_q = vae_q.view(-1, self.num_heads, self.head_dim)
+            vae_q = self.q_norm.forward_gen(vae_q.to(torch.float32))
+            vae_q = self.rotary_op(vae_q.to(vae_cos.dtype).unsqueeze(0), vae_cos, vae_sin).squeeze(0).to(torch.bfloat16)
 
-        # The two replicated image-marker tokens stay on the frozen text expert.
-        text_qkv, _ = self.qkv_proj(text_hidden)
-        text_q, text_k, text_v = text_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        text_q = self.q_norm(text_q.view(-1, self.num_heads, self.head_dim).to(torch.float32))
-        text_k = self.k_norm(text_k.view(-1, self.num_kv_heads, self.head_dim).to(torch.float32))
-        text_v = text_v.view(-1, self.num_kv_heads, self.head_dim)
-        text_q = (
-            self.rotary_op(text_q.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0).to(torch.bfloat16)
-        )
-        text_k = (
-            self.rotary_op(text_k.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0).to(torch.bfloat16)
-        )
-        text_v = text_v.to(torch.bfloat16)
+            # The two replicated image-marker tokens stay on the frozen text expert.
+            text_qkv, _ = self.qkv_proj(text_hidden)
+            text_q, text_k, text_v = text_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            text_q = self.q_norm(text_q.view(-1, self.num_heads, self.head_dim).to(torch.float32))
+            text_k = self.k_norm(text_k.view(-1, self.num_kv_heads, self.head_dim).to(torch.float32))
+            text_v = text_v.view(-1, self.num_kv_heads, self.head_dim)
+            text_q = (
+                self.rotary_op(text_q.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0).to(torch.bfloat16)
+            )
+            text_k = (
+                self.rotary_op(text_k.to(text_cos.dtype).unsqueeze(0), text_cos, text_sin).squeeze(0).to(torch.bfloat16)
+            )
+            text_v = text_v.to(torch.bfloat16)
 
-        vae_k_global = key_gather.wait()
-        vae_v_global = value_gather.wait()
+            key_work, key_gather = key_gather, None
+            vae_k_global = key_work.wait()
+            value_work, value_gather = value_gather, None
+            vae_v_global = value_work.wait()
+        except Exception:
+            for gather in (key_gather, value_gather):
+                if gather is not None:
+                    try:
+                        gather.wait()
+                    except Exception:
+                        logger.exception("Failed to drain an in-flight BAGEL K/V all-gather")
+            raise
+
         if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
             ctx_k = torch.cat([past_key_values.key_cache[self.layer_idx], text_k], dim=0)
             ctx_v = torch.cat([past_key_values.value_cache[self.layer_idx], text_v], dim=0)
