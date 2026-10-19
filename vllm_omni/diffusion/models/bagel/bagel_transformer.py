@@ -430,16 +430,6 @@ class BaseNavitOutputWithPast(ModelOutput):
     past_key_values: NaiveCache | None = None
 
 
-def sp_replicated_phases_run_locally(parallel_config: DiffusionParallelConfig | None) -> bool:
-    """Run replicated prefill and cache-update phases locally under any sequence
-    parallelism to avoid duplicate K/V and incorrect cross-rank attention."""
-    if parallel_config is None:
-        return False
-    if getattr(parallel_config, "allgather_degree", 1) > 1:
-        return True
-    return (getattr(parallel_config, "sequence_parallel_size", None) or 1) > 1
-
-
 class PackedAttentionMoT(nn.Module):
     """Packed attention with Mixture-of-Tokens routing for understanding/generation.
 
@@ -498,18 +488,13 @@ class PackedAttentionMoT(nn.Module):
 
         self.rotary_op = RotaryEmbedding(is_neox_style=True)
 
-        # Prefill and cache-update inputs are replicated on every SP rank.
-        # Applying an SP strategy would treat those replicas as sequence shards,
-        # duplicating or mixing K/V across ranks. Run these phases locally; only
-        # sharded denoising uses sequence-parallel attention.
-        replicated_local = sp_replicated_phases_run_locally(parallel_config)
         self.attn_causal = DiffusionAttention(
             num_heads=self.total_num_heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=True,
             num_kv_heads=self.total_num_kv_heads,
-            skip_sequence_parallel=replicated_local,
+            skip_sequence_parallel=True,
         )
         self.attn_noncausal = DiffusionAttention(
             num_heads=self.total_num_heads,
@@ -518,22 +503,14 @@ class PackedAttentionMoT(nn.Module):
             causal=False,
             num_kv_heads=self.total_num_kv_heads,
         )
-        self.attn_noncausal_local: DiffusionAttention | None = (
-            DiffusionAttention(
-                num_heads=self.total_num_heads,
-                head_size=self.head_dim,
-                softmax_scale=1.0 / (self.head_dim**0.5),
-                causal=False,
-                num_kv_heads=self.total_num_kv_heads,
-                skip_sequence_parallel=True,
-            )
-            if replicated_local
-            else None
+        self.attn_noncausal_local = DiffusionAttention(
+            num_heads=self.total_num_heads,
+            head_size=self.head_dim,
+            softmax_scale=1.0 / (self.head_dim**0.5),
+            causal=False,
+            num_kv_heads=self.total_num_kv_heads,
+            skip_sequence_parallel=True,
         )
-
-    def _replicated_noncausal_attn(self) -> DiffusionAttention:
-        """Non-causal attention for a sequence that is replicated across SP ranks."""
-        return self.attn_noncausal_local if self.attn_noncausal_local is not None else self.attn_noncausal
 
     def _is_sp_active(self) -> bool:
         """Check if SP is active for this attention layer."""
@@ -725,12 +702,7 @@ class PackedAttentionMoT(nn.Module):
 
         # NOTE: we reshape to batched (1, S, H, D) for diffusion Attention
         # attn_out should be: (1, text_len + local_vae_len, H, D)
-        # A cache update (update_past_key_values) runs on the full, unsharded VAE
-        # sequence, so under AllGather-KV it is a replicated phase: build the
-        # per-branch sequences by hand below and run attention locally, exactly
-        # like the non-SP path, instead of handing joint tensors to a strategy.
-        replicated_phase = self._is_sp_active() and update_past_key_values
-        if self._is_sp_active() and not replicated_phase:
+        if self._is_sp_active() and not update_past_key_values:
             # Joint mechanism keeps text+cache replicated across SP ranks
             attn_out = self.attn_noncausal(
                 vae_q.unsqueeze(0),
@@ -778,7 +750,7 @@ class PackedAttentionMoT(nn.Module):
                 k_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_k_parts, vae_k_parts)])
                 v_4d = torch.stack([torch.cat([t, v]) for t, v in zip(text_v_parts, vae_v_parts)])
                 metadata = None
-            attn_out = self._replicated_noncausal_attn()(q_4d, k_4d, v_4d, metadata)
+            attn_out = self.attn_noncausal_local(q_4d, k_4d, v_4d, metadata)
 
         attn_out = attn_out.reshape(num_branches, -1, self.q_size)
         text_attn = attn_out[:, :text_per_branch].reshape(-1, self.q_size)
@@ -893,7 +865,7 @@ class PackedAttentionMoT(nn.Module):
             )
             attn_out = attn_out_4d.permute(0, 2, 1, 3)
         else:
-            attn = self.attn_causal if is_causal else self._replicated_noncausal_attn()
+            attn = self.attn_causal if is_causal else self.attn_noncausal_local
             attn_out = attn(
                 q.unsqueeze(0),
                 full_k.unsqueeze(0),

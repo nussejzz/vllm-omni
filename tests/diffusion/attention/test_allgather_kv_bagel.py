@@ -18,7 +18,6 @@ from vllm_omni.diffusion.attention.parallel.allgather_kv import (
 from vllm_omni.diffusion.models.bagel.bagel_transformer import (
     Bagel,
     PackedAttentionMoT,
-    sp_replicated_phases_run_locally,
 )
 from vllm_omni.diffusion.models.bagel.mot.mot_layernorm import MoTRMSNorm
 from vllm_omni.diffusion.models.bagel.mot.mot_qkv_parallel_linear import MoTQKVParallelLinear
@@ -482,19 +481,3 @@ def test_skip_sequence_parallel_layer_does_not_build_a_strategy(monkeypatch: pyt
     assert attn.parallel_strategy is attn._no_parallel_strategy
     with pytest.raises(AssertionError, match="factory must not run"):
         Attention(num_heads=4, head_size=8, softmax_scale=0.5, causal=True)
-
-
-@pytest.mark.parametrize(
-    ("parallel_config", "expected"),
-    [
-        (None, False),
-        (SimpleNamespace(sequence_parallel_size=1, allgather_degree=1), False),
-        (SimpleNamespace(sequence_parallel_size=None, allgather_degree=1), False),
-        (SimpleNamespace(sequence_parallel_size=4, allgather_degree=4), True),
-        # Ulysses / Ring: the replicated phases must not be all-to-all'd either.
-        (SimpleNamespace(sequence_parallel_size=4, ulysses_degree=4, allgather_degree=1), True),
-        (SimpleNamespace(sequence_parallel_size=2, ring_degree=2, allgather_degree=1), True),
-    ],
-)
-def test_replicated_phases_run_locally_under_any_sequence_parallelism(parallel_config, expected) -> None:
-    assert sp_replicated_phases_run_locally(parallel_config) is expected

@@ -23,6 +23,7 @@ See supported models list in [Diffusion Features - Supported Models](../../diffu
 - **Ring-Attention** ([paper](https://arxiv.org/abs/2310.01889)): Uses ring-based P2P communication with sharded sequence dimension throughout
 - **Hybrid Ulysses + Ring**: Combines both for larger scale parallelism (`ulysses_degree × ring_degree`)
 - **AllGather-KV**: Keeps Q sequence-sharded and all-gathers only K/V per attention layer. Especially useful for GQA denoisers where K/V have substantially fewer heads than Q (BAGEL first).
+- **Ulysses × AllGather-KV**: A two-dimensional topology where Ulysses shards attention heads and AllGather-KV makes K/V global (`ulysses_degree × allgather_degree`)
 
 ---
 
@@ -96,11 +97,12 @@ omni = Omni(
 ```
 
 AllGather-KV trades replicated full-sequence K/V memory for lower communication
-volume. It is mutually exclusive with Ulysses and Ring. For parallel degree `P`
-and GQA head ratio `R = Hq / Hkv`, its per-rank communication volume relative to
-Ulysses is `P / (R + 1)` (ignoring collective implementation overhead). BAGEL
-has `R=7`, so `allgather_degree=4` communicates half as many bytes as
-Ulysses-SP 4.
+volume. Plain AllGather-KV sets `ulysses_degree=1` and `ring_degree=1`; the
+general strategy may be combined with Ulysses as described below, but not with
+Ring. For parallel degree `P` and GQA head ratio `R = Hq / Hkv`, its per-rank
+communication volume relative to Ulysses is `P / (R + 1)` (ignoring collective
+implementation overhead). BAGEL has `R=7`, so `allgather_degree=4` communicates
+half as many bytes as Ulysses-SP 4.
 
 BAGEL's complete-request `generate_image` path launches asynchronous K/V
 All-Gathers between independent K, V, and Q projections, so the communication
@@ -113,6 +115,54 @@ latent every step. Full K/V must fit on each rank, sequence shards must be equal
 and unmasked, and quantized QKV projections must expose independent projection
 slices to use the overlap path. A ready-made recipe is
 `vllm_omni/deploy/bagel_allgather_kv4.yaml`.
+
+**Ulysses × AllGather-KV** (4 GPUs total, no Ring in the attention computation):
+
+```python
+omni = Omni(
+    model="Qwen/Qwen-Image",
+    parallel_config=DiffusionParallelConfig(ulysses_degree=2, allgather_degree=2)
+)
+```
+
+### Ulysses × AllGather-KV
+
+This topology reaches larger SP degrees without putting Ring Attention on the
+critical path. Each rank starts from `[B, S / (U × A), H, D]` and the forward is:
+
+```text
+Ulysses all-to-all (U group):  Q, K, V → [B, S / A,     H / U, D]
+K/V AllGather     (A group):   K, V    → [B, S,         H / U, D]
+local-Q / global-KV attention: O       → [B, S / A,     H / U, D]
+reverse Ulysses all-to-all:    O       → [B, S / (U × A), H,    D]
+```
+
+The kernel always sees a local-Q/global-KV problem, so the full global sequence
+is materialized in a single, ordered K/V tensor. That matters for attention
+backends that need stable global K/V indexing — sparse-mask generation in
+particular — which is awkward under Ring Attention because Ring keeps K/V
+block-local and owns distributed attention itself.
+
+Choosing between the two 4-GPU options is mostly about the attention backend: if
+the backend can consume a global K/V tensor, prefer Ulysses × AllGather-KV; if
+the sequence is large enough that materializing global K/V does not fit, use
+Ulysses × Ring instead.
+
+Constraints:
+
+- `ring_degree` must be `1` — composing all three SP dimensions is not supported.
+- Non-causal attention only.
+- Every rank's region must be equally long, so the shared sequence must be evenly
+  shardable across the SP group (or the model's `_sp_plan` must use `auto_pad`).
+  A mismatch fails fast instead of corrupting the collective.
+- 2D key masks are supported: an image mask must cover the gathered *global*
+  image keys replicated across SP ranks (the same contract as plain
+  AllGather-KV), and a joint text-padding mask (`joint_attn_mask`, e.g.
+  Qwen-Image with unequal prompt lengths) is merged automatically in
+  `joint_strategy` order. Masks covering only the local shard fail fast.
+  `mask_sp_padding=True` builds exactly such a global 2D mask, so strict
+  padding masking works under this topology; 4D masks keep query-range slicing.
+- Not supported with Scheduler-paged KV or with `diffusion_attention_backend="TRTLLM_ATTN"`.
 
 ---
 
@@ -153,6 +203,17 @@ python examples/offline_inference/text_to_image/text_to_image.py \
     --width 1024 --height 1024
 ```
 
+**Ulysses × AllGather-KV:**
+
+```bash
+# 2 Ulysses × 2 AllGather-KV = 4 GPUs total, ring_degree stays 1
+python examples/offline_inference/text_to_image/text_to_image.py \
+    --model Qwen/Qwen-Image \
+    --prompt "A cat sitting on a windowsill" \
+    --ulysses-degree 2 --allgather-degree 2 \
+    --width 1024 --height 1024
+```
+
 ### Online Serving
 
 **Ulysses-SP:**
@@ -189,6 +250,13 @@ vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni --port 8091 \
     --deploy-config vllm_omni/deploy/bagel_allgather_kv4.yaml
 ```
 
+**Ulysses × AllGather-KV:**
+
+```bash
+# Text-to-image (requires >= 4 GPUs); --ring must stay 1
+vllm serve Qwen/Qwen-Image --omni --port 8091 --usp 2 --allgather-degree 2
+```
+
 ---
 
 ## Configuration Parameters
@@ -199,14 +267,13 @@ In `DiffusionParallelConfig`:
 | ----------- | ------ | --------- | ------------- |
 | `ulysses_degree` | int | 1 | Number of GPUs for Ulysses-SP. Uses all-to-all communication. |
 | `ring_degree` | int | 1 | Number of GPUs for Ring-Attention. Uses P2P ring communication. |
-| `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV. Q remains local; K/V are all-gathered per layer. Mutually exclusive with Ulysses/Ring. |
+| `allgather_degree` | int | 1 | Number of GPUs for AllGather-KV sequence parallelism. Gathers K/V in an orthogonal group so every rank runs local-Q/global-KV attention. May be combined with `ulysses_degree`, but not with `ring_degree > 1`. |
 | `ulysses_mode` | str | `"default"` | Ulysses attention mode. Set to `"advanced_uaa"` to handle arbitrary sequence lengths and head counts without padding. |
 | `mask_sp_padding` | bool | `False` | When the sequence length is not divisible by the SP size, tokens are auto-padded with zeros. Set to `True` to mask those padding tokens (strict, but uses the slower varlen attention path); the default `False` leaves them unmasked, keeping the fast path with negligible numerical impact. |
 
 **Notes:**
 
-- Total sequence parallel size equals `ulysses_degree × ring_degree`, or `allgather_degree` when AllGather-KV is enabled
-- `allgather_degree > 1` requires `ulysses_degree=1` and `ring_degree=1`
+- Total sequence parallel size equals `ulysses_degree × ring_degree × allgather_degree`
 - Degrees must evenly divide the sequence length for optimal performance (or use `ulysses_mode="advanced_uaa"` for Ulysses-SP)
 - `mask_sp_padding` is an experimental feature, currently only supported by `Wan2.2`, `Wan2.2 Vace`, `Qwen-Image`, `Flux 2`, and `HunyuanVideo 1.5`
 
