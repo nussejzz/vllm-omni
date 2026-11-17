@@ -8,6 +8,12 @@ Models supply an x0 callable; schedules and history live in request-local states
 RES coefficients follow ComfyUI_RH_MinMaxH3 sampler_core.py at
 6abdf97ae8cdce548c751ce850adc5010b583b7c. Euler preserves the original
 floating-point operation order.
+
+``renoise`` is the consistency-model ladder of Pika H3 Flex
+(Pika-Labs/Pika-H3-Flex f961d7e, ``src/pika_h3/core/sampling.py:14-21,87-109``):
+each step maps x0 back onto the flow at the next sigma with fresh noise. It is
+not a user-selectable sampler; a model that owns such a contract supplies the
+request's noise stream as the sampling state's history.
 """
 
 from __future__ import annotations
@@ -309,6 +315,81 @@ def sample_res_multistep(
             _commit(active, outputs, callback, histories=new_histories)
 
 
+RENOISE_SAMPLER = "renoise"
+
+
+class RenoiseNoiseSource(ABC):
+    """Request-owned fresh-noise stream for the re-noising sampler.
+
+    ``draw(step_index, like)`` returns one noise tensor per latent stream whose
+    ``like`` entry is a tensor (same shape, float32, on its device) and ``None``
+    where the entry is ``None`` (a stream landing on sigma 0 draws nothing).
+    Draw order across streams is the source's contract. A repeated call for the
+    same step must return the same values, so a failed step can be retried
+    without advancing the stream.
+    """
+
+    @abstractmethod
+    def draw(self, step_index: int, like: Sequence[torch.Tensor | None]) -> tuple[torch.Tensor | None, ...]: ...
+
+
+def renoise_step(denoised: torch.Tensor, noise: torch.Tensor | None, *, sigma_next: float) -> torch.Tensor:
+    """``(1 - s) * x0 + s * eps`` in float32 with three separately rounded ops; x0 at s=0.
+
+    Matches Pika's ``add_noise``: ``1 - s`` is a float32 tensor op, then one
+    rounded multiply per term and a rounded add, cast back to x0's dtype.
+    """
+    sigma_next = _validate_sigma(sigma_next, "sigma_next")
+    if sigma_next > 1.0:
+        raise ValueError("sigma_next must be in [0, 1]")
+    if sigma_next == 0.0:
+        return denoised
+    if noise is None or noise.shape != denoised.shape:
+        raise ValueError("Re-noising requires noise matching the denoised shape")
+    sigma = denoised.new_tensor(sigma_next, dtype=torch.float32)
+    out = ((1 - sigma) * denoised.float() + sigma * noise.float()).to(dtype=denoised.dtype)
+    return out
+
+
+def sample_renoise(
+    model: DenoiseModel,
+    states: Sequence[SamplingState],
+    *,
+    num_steps: int | None = None,
+    callback: SampleCallback | None = None,
+    step_context: StepContext | None = None,
+) -> None:
+    """Consistency re-noising; every state's history is its RenoiseNoiseSource.
+
+    The model returns x0 for each stream; each stream is then re-noised to its
+    own next sigma. The last step (all next sigmas 0) returns the clean x0.
+    The history object is stateful but replays a retried step, so it is kept
+    as-is on commit.
+    """
+    for active in _sampling_steps(states, num_steps):
+        with step_context(active) if step_context else nullcontext():
+            sources = []
+            for state in active:
+                if not isinstance(state.history, RenoiseNoiseSource):
+                    raise ValueError("Re-noise sampling requires a RenoiseNoiseSource history")
+                sources.append(state.history)
+            predictions = _evaluate(model, _current_evaluations(active))
+            outputs = []
+            for state, source, prediction in zip(active, sources, predictions, strict=True):
+                i = state.step_index
+                next_sigmas = tuple(float(s[i + 1]) for s in state.sigmas)
+                noise = source.draw(i, tuple(None if n == 0.0 else x0 for x0, n in zip(prediction, next_sigmas)))
+                if len(noise) != len(prediction):
+                    raise ValueError("Re-noise source must return one entry per latent stream")
+                outputs.append(
+                    tuple(
+                        renoise_step(x0, eps, sigma_next=n)
+                        for x0, eps, n in zip(prediction, noise, next_sigmas, strict=True)
+                    )
+                )
+            _commit(active, outputs, callback)
+
+
 class Sampler(ABC):
     """ComfyUI-style sampler interface; models expose prediction, not sampling."""
 
@@ -349,5 +430,9 @@ class KSAMPLER(Sampler):
 
 
 def sampler_object(name: str | None = None) -> KSAMPLER:
+    if name == RENOISE_SAMPLER:
+        # Model-owned contract, deliberately absent from resolve_sampler_name():
+        # requests cannot select it, a pipeline selects it with its noise source.
+        return KSAMPLER(sample_renoise)
     functions = {"euler": sample_euler, "res_multistep": sample_res_multistep}
     return KSAMPLER(functions[resolve_sampler_name(name)])
