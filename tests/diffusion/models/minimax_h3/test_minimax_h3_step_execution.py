@@ -929,14 +929,17 @@ def test_prepare_encode_seeds_runner_visible_state(monkeypatch, batch_frames, sa
     assert state.extra[mod._STEP_SHAPE]["height"] == 96
 
     pipeline.od_config = SimpleNamespace()
-    monkeypatch.setattr(pipeline, "_unpack_denoised_rows", lambda *args, **kwargs: (torch.zeros(1), torch.zeros(1)))
+    # Plain instance attributes: the pipeline is a bare object.__new__ module, so
+    # monkeypatch's teardown delattr would fail inside nn.Module.__delattr__ and
+    # leave the class-level patches above applied to later tests on the worker.
+    pipeline._unpack_denoised_rows = lambda *args, **kwargs: (torch.zeros(1), torch.zeros(1))
     calls = []
 
     def decode_to_mp4(*args, **kwargs):
         calls.append(kwargs)
         return b"mp4"
 
-    monkeypatch.setattr(pipeline, "decode_to_mp4", decode_to_mp4)
+    pipeline.decode_to_mp4 = decode_to_mp4
     assert pipeline.post_decode(state).output == (b"mp4", None)
     assert calls[0]["batch_frames"] == batch_frames
 

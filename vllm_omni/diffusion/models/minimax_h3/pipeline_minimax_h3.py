@@ -196,6 +196,7 @@ from .packed_tokens import (
 from .pika import (
     PIKA_AUDIO_SHIFT,
     PIKA_AUGMENTATION_SEED_OFFSET,
+    PIKA_DEBUG_BASE_DIT_ENV,
     PIKA_DUMP_DIR_ENV,
     PIKA_INJECT_DIR_ENV,
     PIKA_NOISE_VERSION,
@@ -588,6 +589,10 @@ def _check_replicated_across_dit_ranks(*tensors: torch.Tensor, what: str) -> Non
         )
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() not in ("", "0", "false", "off")
+
+
 def _additional_flag(od_config: Any, key: str) -> bool:
     value = (getattr(od_config, "additional_config", None) or {}).get(key, False)
     if type(value) is not bool:
@@ -942,8 +947,19 @@ class MiniMaxH3Pipeline(
             raise ValueError(
                 f"Pika H3 Flex {spec.task} requires --task-type {spec.task}, got partition {self.partition!r}"
             )
-        if modular or any(schedule is not None for schedule in self._base_schedule_by_partition.values()):
+        if (
+            modular
+            or self._fasth3_checkpoint is not None
+            or any(schedule is not None for schedule in self._base_schedule_by_partition.values())
+        ):
+            # A FastH3 checkpoint would also overwrite the ladder with its PDD sigmas.
             raise ValueError("Pika H3 Flex requires the original MiniMax-H3 base checkpoint, not a distilled one")
+        cache_backend = str(getattr(od_config, "cache_backend", None) or "none").lower()
+        if cache_backend != "none":
+            # Otherwise every request without quality=lossless would fail at request time.
+            raise ValueError(
+                f"Pika H3 Flex runs all six forwards uncached; start it with --cache-backend none, got {cache_backend}"
+            )
         lora_scale = getattr(od_config, "lora_scale", 1.0)
         if isinstance(lora_scale, (list, tuple)):
             lora_scale = lora_scale[0] if len(lora_scale) == 1 else None
@@ -965,7 +981,16 @@ class MiniMaxH3Pipeline(
         torch.backends.cudnn.allow_tf32 = True
         # The LoRA manager reads this per instance: the startup adapter becomes
         # the pinned adapter of every request, always at scale 1.
-        self.diffusion_lora_fixed_adapter = True
+        if _env_flag(PIKA_DEBUG_BASE_DIT_ENV):
+            # Parity tool only: the manager loads the adapter but deactivates it
+            # for every request (no lora_request), so the base DiT runs under
+            # Pika's sampler and noise. Outputs are not Pika samples.
+            logger.warning(
+                "%s=1: Pika H3 Flex adapter is NOT applied (base DiT under the Pika sampler); parity debugging only",
+                PIKA_DEBUG_BASE_DIT_ENV,
+            )
+        else:
+            self.diffusion_lora_fixed_adapter = True
         logger.info(
             "Pika H3 Flex server mode: %s %s (%s, %s), %d re-noising steps, sigmas %s, TF32 matmul/cudnn %s -> %s",
             spec.release_id,
@@ -978,6 +1003,23 @@ class MiniMaxH3Pipeline(
             (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32),
         )
         return spec
+
+    def _check_pika_is_exclusive(self) -> None:
+        """VDN, Open-H3-Regenerate and FastH3 fusions also resolve from --lora-path; none composes with Pika."""
+        if getattr(self, "_pika_spec", None) is None:
+            return
+        claimed = [
+            name
+            for name, value in (
+                ("VDN", self._vdn),
+                ("Open-H3-Regenerate", self._regenerate),
+                ("a FastH3 weight fusion", self._fasth3),
+                ("a FastH3 checkpoint", self._fasth3_checkpoint),
+            )
+            if value is not None
+        ]
+        if claimed:
+            raise ValueError(f"Pika H3 Flex cannot be combined with {' or '.join(claimed)}")
 
     def _validate_pika_request(self, sampling: Any, task: str) -> PikaSpec | None:
         """The Pika spec this request runs under, after checking its options; None on base servers."""
@@ -1383,6 +1425,7 @@ class MiniMaxH3Pipeline(
             if self._vdn is None and self._regenerate is None
             else None
         )
+        self._check_pika_is_exclusive()
         if self._fasth3 is not None and self._fasth3.requires_vsa:
             # The artifact assigns a compression gate per DiT block, so those
             # modules have to exist before load_weights streams them in. Only
@@ -1512,6 +1555,9 @@ class MiniMaxH3Pipeline(
                 ),
                 build_fp32=vae_build_fp32,
                 decode_fp32=vae_decode_fp32,
+                # Pika H3 Flex: image references are encoded under Pika's numerics
+                # (cuDNN TF32 allowed), not the base Hopper FP32 policy.
+                keyframe_encode_cudnn_tf32=True if self._pika_spec is not None else None,
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),

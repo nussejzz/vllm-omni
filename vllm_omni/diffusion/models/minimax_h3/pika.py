@@ -48,6 +48,16 @@ PIKA_TARGET_MODULES = ("to_q", "to_k", "to_v", "to_out.0", "ff.net.0.proj", "ff.
 PIKA_NOISE_VERSION = "pika-flex-noise-v1"
 PIKA_RENOISE_SEED_OFFSET = 1
 PIKA_AUGMENTATION_SEED_OFFSET = 7919
+# Two requests whose seeds differ by one of these share a generator stream
+# (seed S's re-noise stream is seed S+1's initial stream; its augmentation
+# stream is seed S+7919's initial stream and seed S+7918's re-noise stream), so
+# their samples are correlated. Batch generation should space seeds further
+# apart, e.g. ``base + k * 10007``.
+PIKA_CORRELATED_SEED_OFFSETS = (
+    PIKA_RENOISE_SEED_OFFSET,
+    PIKA_AUGMENTATION_SEED_OFFSET - PIKA_RENOISE_SEED_OFFSET,
+    PIKA_AUGMENTATION_SEED_OFFSET,
+)
 # Visual reference rows are noised to t=0.999 (``H3DiffusionWrapper._noise_condition_rows``).
 PIKA_CONDITION_NOISE_AUG = 0.999
 PIKA_NUMERICS_POLICY = {"ref2va": "fp32_conditioning_v1", "fl2va": "bf16_conditioning_v1"}
@@ -134,6 +144,17 @@ class PikaSpec:
             raise ValueError(f"{self.name} requires uncached denoising (Cache-DiT skips steps); use quality=lossless")
         if getattr(sampling, "lora_request", None) is not None:
             raise ValueError(f"{self.name} serves its startup adapter at scale 1; remove the request-level lora field")
+        # One output per request. The pipeline seeds output k with ``seed + k``,
+        # and under pika-flex-noise-v1 output k's initial-noise stream (seed + k)
+        # is output k-1's re-noise stream (seed + k - 1 + 1): the samples would be
+        # strongly correlated without any error. Send separate requests with
+        # well-separated seeds instead (see PIKA_CORRELATED_SEED_OFFSETS).
+        num_outputs = getattr(sampling, "num_outputs_per_prompt", None)
+        if num_outputs is not None and (isinstance(num_outputs, bool) or num_outputs != 1):
+            raise ValueError(
+                f"{self.name} produces one output per request (num_outputs_per_prompt=1); "
+                f"got {num_outputs!r}. Send one request per seed and do not use adjacent seeds"
+            )
 
 
 def _require(manifest: dict[str, Any], key: str, expected: Any) -> None:
@@ -348,6 +369,12 @@ class PikaDebugDump:
 
 
 PIKA_INJECT_DIR_ENV = "VLLM_OMNI_PIKA_INJECT_GOLDEN"
+# Opt-in parity tool: ``VLLM_OMNI_PIKA_DEBUG_BASE_DIT=1`` keeps the Pika server
+# mode (sampler, noise streams, numerics) but does not pin the adapter, so
+# requests run the base DiT. Used to separate DiT kernel differences from LoRA
+# kernel differences against a Pika run with its adapter disabled. Never for
+# serving: outputs are not Pika H3 Flex samples.
+PIKA_DEBUG_BASE_DIT_ENV = "VLLM_OMNI_PIKA_DEBUG_BASE_DIT"
 
 
 def load_pika_golden_conditioning(
@@ -391,6 +418,8 @@ def describe_pika_sigmas() -> str:
 __all__ = [
     "PIKA_AUDIO_SHIFT",
     "PIKA_AUGMENTATION_SEED_OFFSET",
+    "PIKA_CORRELATED_SEED_OFFSETS",
+    "PIKA_DEBUG_BASE_DIT_ENV",
     "PIKA_DUMP_DIR_ENV",
     "PIKA_INJECT_DIR_ENV",
     "PIKA_BASE_REVISION",

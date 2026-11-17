@@ -49,6 +49,16 @@ from .test_minimax_h3_step_execution import _make_branch, _make_state, _SegmentM
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
+
+@pytest.fixture(autouse=True)
+def _no_pinned_lora_factors_without_cuda(monkeypatch):
+    """vLLM pins CPU LoRA factors whenever its platform is CUDA, which it also is
+    on a GPU host with ``CUDA_VISIBLE_DEVICES=''``; pinning then fails. These
+    are CPU tests, so do not pin when no device is visible."""
+    if not torch.cuda.is_available():
+        monkeypatch.setattr("vllm.lora.lora_model.PIN_MEMORY", False)
+
+
 # float32 ladders from the Pika contract (float64 shift, then float32).
 _PIKA_VIDEO = [1.0, 0.97297299, 0.92307693, 0.80000001, 0.57142860, 0.33333334, 0.0]
 _PIKA_AUDIO = [1.0, 0.89999998, 0.75, 0.5, 0.25, 0.11111111, 0.0]
@@ -225,6 +235,8 @@ def _sampling(**overrides):
         {"extra_args": {"regenerate": True}},
         {"quality": "high"},
         {"lora_request": LoRARequest("other", 3, "/unused")},
+        {"num_outputs_per_prompt": 2},
+        {"num_outputs_per_prompt": 10},
     ],
 )
 def test_pika_request_cannot_silently_change_sampling(overrides):
@@ -239,10 +251,30 @@ def test_pika_request_cannot_silently_change_sampling(overrides):
         {"num_inference_steps": 6},
         {"extra_args": {"flow_shift": "12", "audio_flow_shift": 3}},
         {"quality": "lossless"},
+        {"num_outputs_per_prompt": 1},
     ],
 )
 def test_pika_request_accepts_its_own_contract(overrides):
     _spec().check_request(_sampling(**overrides), "ref2va")
+
+
+def test_pika_rejects_multiple_outputs_because_adjacent_seeds_share_streams():
+    """Output k is seeded ``seed + k``: its initial noise would be output k-1's step-0 re-noise."""
+    from vllm_omni.diffusion.models.minimax_h3.pika import PIKA_CORRELATED_SEED_OFFSETS
+
+    assert pipeline_module._minimax_h3_output_seeds(42, 2) == [42, 43]
+    first, second = _noise(42), _noise(43)
+    renoise0_video, renoise0_audio = first.draw(0, (torch.zeros(12, 96), torch.zeros(6, 32)))
+    initial_video, initial_audio = second.initial_rows()
+    assert torch.equal(initial_video, renoise0_video) and torch.equal(initial_audio, renoise0_audio)
+    assert PIKA_CORRELATED_SEED_OFFSETS == (1, 7918, 7919)
+    with pytest.raises(ValueError, match="one output per request"):
+        _spec().check_request(_sampling(num_outputs_per_prompt=2), "ref2va")
+    pipe = object.__new__(pipeline_module.MiniMaxH3Pipeline)
+    pipe.od_config = OmniDiffusionConfig()
+    pipe._pika_spec = _spec()
+    with pytest.raises(OmniClientError, match="one output per request"):
+        pipe._validate_pika_request(_sampling(num_outputs_per_prompt=2), "ref2va")
 
 
 def test_pika_task_and_step_execution_rules():
@@ -306,8 +338,54 @@ def test_pika_startup_mode_is_claimed_only_by_a_pika_lora_path(tmp_path):
             )
         with pytest.raises(ValueError, match="original"):
             _startup_pipe()._resolve_startup_pika(SimpleNamespace(lora_path=str(tmp_path)), modular=True)
+        fasth3 = _startup_pipe()
+        fasth3._fasth3_checkpoint = object()
+        with pytest.raises(ValueError, match="original"):
+            fasth3._resolve_startup_pika(SimpleNamespace(lora_path=str(tmp_path)), modular=False)
+        for backend in ("cache_dit", "tea_cache"):
+            with pytest.raises(ValueError, match="cache-backend none"):
+                _startup_pipe()._resolve_startup_pika(
+                    SimpleNamespace(lora_path=str(tmp_path), cache_backend=backend), modular=False
+                )
+        assert (
+            _startup_pipe()._resolve_startup_pika(
+                SimpleNamespace(lora_path=str(tmp_path), cache_backend="none"), modular=False
+            )
+            is not None
+        )
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+def test_pika_debug_base_dit_does_not_pin_the_adapter(tmp_path, monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.pika import PIKA_DEBUG_BASE_DIT_ENV
+
+    _artifact(tmp_path)
+    previous = torch.backends.cuda.matmul.allow_tf32
+    try:
+        monkeypatch.setenv(PIKA_DEBUG_BASE_DIT_ENV, "1")
+        pipe = _startup_pipe()
+        assert pipe._resolve_startup_pika(SimpleNamespace(lora_path=str(tmp_path)), modular=False) is not None
+        assert getattr(pipe, "diffusion_lora_fixed_adapter", False) is not True
+        monkeypatch.setenv(PIKA_DEBUG_BASE_DIT_ENV, "0")
+        pipe = _startup_pipe()
+        pipe._resolve_startup_pika(SimpleNamespace(lora_path=str(tmp_path)), modular=False)
+        assert pipe.diffusion_lora_fixed_adapter is True
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+@pytest.mark.parametrize("attribute", ["_vdn", "_regenerate", "_fasth3", "_fasth3_checkpoint"])
+def test_pika_server_mode_is_exclusive_with_other_lora_path_consumers(attribute):
+    pipe = _startup_pipe()
+    pipe._pika_spec = None
+    setattr(pipe, attribute, object())
+    pipe._check_pika_is_exclusive()  # base servers: unchanged
+    pipe._pika_spec = _spec()
+    with pytest.raises(ValueError, match="cannot be combined"):
+        pipe._check_pika_is_exclusive()
+    setattr(pipe, attribute, None)
+    pipe._check_pika_is_exclusive()
 
 
 def test_pika_adapter_only_loads_as_the_startup_adapter(tmp_path, monkeypatch):
@@ -735,3 +813,21 @@ def test_vae_fp32_flags_are_opt_in(monkeypatch):
     assert seen == [torch.bfloat16, torch.float32]
     assert default.decode_dtype == torch.float16 and len(installed) == 1  # base: FP16 autocast + fused path
     assert fp32.decode_dtype == torch.float32  # Pika: FP32 decode, fused FP16 path skipped
+    assert default.keyframe_encode_cudnn_tf32 is None  # base keeps its Hopper FP32 image-encode policy
+
+
+def test_pika_image_encode_policy_allows_cudnn_tf32():
+    """Pika encodes image references with cuDNN TF32 on; base keeps its own policy."""
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    saved = (torch.backends.cudnn.allow_tf32, torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark)
+    try:
+        torch.backends.cudnn.allow_tf32, torch.backends.cudnn.deterministic = False, True
+        with vae_module._minimax_h3_keyframe_encode_context(torch.device("cuda", 0), cudnn_tf32=True):
+            assert torch.backends.cudnn.allow_tf32 is True
+            assert torch.backends.cudnn.deterministic is False and torch.backends.cudnn.benchmark is False
+        assert (torch.backends.cudnn.allow_tf32, torch.backends.cudnn.deterministic) == (False, True)
+        with vae_module._minimax_h3_keyframe_encode_context(torch.device("cpu"), cudnn_tf32=True):
+            assert torch.backends.cudnn.allow_tf32 is False  # CPU: untouched
+    finally:
+        torch.backends.cudnn.allow_tf32, torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = saved

@@ -52,9 +52,19 @@ logger = init_logger(__name__)
 @contextmanager
 def _minimax_h3_keyframe_encode_context(
     device: torch.device,
+    *,
+    cudnn_tf32: bool | None = None,
 ) -> Iterator[None]:
     if device.type != "cuda":
         yield
+        return
+    if cudnn_tf32 is not None:
+        # Caller-owned policy. Pika H3 Flex encodes its image references with
+        # PyTorch's default cuDNN settings and TF32 allowed (``core/numerics.py``
+        # fp32_conditioning_v1); the Hopper FP32-deterministic policy below moves
+        # those latents by ~1% relative L2 against Pika's.
+        with torch.backends.cudnn.flags(enabled=True, benchmark=False, deterministic=False, allow_tf32=cudnn_tf32):
+            yield
         return
 
     # Deterministic cuDNN algorithms can still use reduced-precision TF32.
@@ -381,8 +391,11 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         allow_decoder_compile: bool = False,
         build_fp32: bool = False,
         decode_fp32: bool = False,
+        keyframe_encode_cudnn_tf32: bool | None = None,
     ) -> None:
         super().__init__()
+        # None keeps the base image-encode policy (_minimax_h3_keyframe_encode_context).
+        self.keyframe_encode_cudnn_tf32 = keyframe_encode_cudnn_tf32
         self._device_target = device
         self.encode_only = bool(encode_only)
         self.decode_only = bool(decode_only)
@@ -1001,7 +1014,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 for device in devices:
                     with self.device_module.device(device):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
-                with _minimax_h3_keyframe_encode_context(parameter.device):
+                cudnn_tf32 = getattr(self, "keyframe_encode_cudnn_tf32", None)
+                with (
+                    _minimax_h3_keyframe_encode_context(parameter.device)
+                    if cudnn_tf32 is None  # base: the call is unchanged
+                    else _minimax_h3_keyframe_encode_context(parameter.device, cudnn_tf32=cudnn_tf32)
+                ):
                     latent = self.model.encode_images(
                         image,
                         use_fp16_latent=True,
