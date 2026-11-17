@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Load MiniMax-H3 Turbo and native H3 LoRA adapters."""
+"""Load MiniMax-H3 Turbo, Pika H3 Flex and native H3 LoRA adapters."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from vllm.model_executor.layers.linear import LinearBase, MergedColumnParallelLi
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.lora.request import LoRARequest
+
+from .pika import PIKA_ALPHA, PIKA_RANK, PikaSpec, read_pika_spec, verify_pika_weights
 
 logger = init_logger(__name__)
 
@@ -160,8 +162,8 @@ def _select_turbo_file(artifact_path: str | Path) -> Path | None:
     return None
 
 
-def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
-    """Validate a Diffusers-layout Turbo tensor set and pack it for the manager."""
+def _validate_and_convert_tensors(checkpoint, *, label: str = "MiniMax-H3 Turbo") -> dict[str, torch.Tensor]:
+    """Validate a Diffusers-layout Turbo/Pika tensor set and pack it for the manager."""
 
     tensors: dict[str, torch.Tensor] = {}
     pairs: dict[str, set[str]] = {}
@@ -174,30 +176,29 @@ def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
             raw_target = name[: -len(_LORA_B_SUFFIX)]
             side = "b"
         else:
-            raise ValueError(f"Unconsumed MiniMax-H3 Turbo tensor: {name!r}")
+            raise ValueError(f"Unconsumed {label} tensor: {name!r}")
         raw_targets.add(raw_target)
 
         mapped_name = _TURBO_WEIGHTS_MAPPER.apply_list([name])[0]
         mapped_target = mapped_name.rsplit(".lora_", 1)[0]
         if mapped_target.rsplit(".", 1)[-1] not in _TURBO_TARGETS:
-            raise ValueError(f"Unsupported MiniMax-H3 Turbo target: {raw_target!r}")
+            raise ValueError(f"Unsupported {label} target: {raw_target!r}")
         target_sides = pairs.setdefault(mapped_target, set())
         if side in target_sides:
-            raise ValueError(f"Duplicate MiniMax-H3 Turbo tensor for {mapped_target}.{side}")
+            raise ValueError(f"Duplicate {label} tensor for {mapped_target}.{side}")
         target_sides.add(side)
 
         tensor = checkpoint.get_tensor(name)
         if tensor.ndim != 2:
-            raise ValueError(f"MiniMax-H3 Turbo LoRA tensors must be matrices, got {name}={tuple(tensor.shape)}")
+            raise ValueError(f"{label} LoRA tensors must be matrices, got {name}={tuple(tensor.shape)}")
         suffix = next((suffix for suffix in _TURBO_RAW_TARGET_SUFFIXES if raw_target.endswith(suffix)), None)
         if suffix is None:
-            raise ValueError(f"MiniMax-H3 Turbo LoRA contains unsupported target: {raw_target}")
+            raise ValueError(f"{label} LoRA contains unsupported target: {raw_target}")
         input_dim, output_dim = _TURBO_TARGET_DIMS[suffix]
         expected_shape = (_TURBO_RANK, input_dim) if side == "a" else (output_dim, _TURBO_RANK)
         if tuple(tensor.shape) != expected_shape:
             raise ValueError(
-                f"MiniMax-H3 Turbo tensor has invalid global shape: {name}={tuple(tensor.shape)}, "
-                f"expected={expected_shape}"
+                f"{label} tensor has invalid global shape: {name}={tuple(tensor.shape)}, expected={expected_shape}"
             )
         if side == "b" and ".ff.net.0.proj." in name:
             value, gate = tensor.chunk(2, dim=0)
@@ -209,12 +210,12 @@ def _validate_and_convert_tensors(checkpoint) -> dict[str, torch.Tensor]:
 
     incomplete = sorted(target for target, sides in pairs.items() if sides != {"a", "b"})
     if incomplete:
-        raise ValueError(f"Incomplete MiniMax-H3 Turbo LoRA pairs: {incomplete}")
+        raise ValueError(f"Incomplete {label} LoRA pairs: {incomplete}")
     missing = sorted(_TURBO_EXPECTED_RAW_TARGETS - raw_targets)
     unexpected = sorted(raw_targets - _TURBO_EXPECTED_RAW_TARGETS)
     if missing or unexpected:
         raise ValueError(
-            "MiniMax-H3 Turbo target set does not match the published artifact layout: "
+            f"{label} target set does not match the published artifact layout: "
             f"missing={len(missing)} {missing[:5]}, unexpected={len(unexpected)} {unexpected[:5]}"
         )
     return tensors
@@ -322,6 +323,60 @@ def load_minimax_h3_turbo_lora(
         spec.alpha,
         spec.video_shift,
         spec.audio_shift,
+    )
+    return lora_model, peft_helper, spec
+
+
+def load_pika_h3_lora(
+    *,
+    partition: str,
+    lora_request: LoRARequest,
+    lora_path: str | Path,
+    dtype: torch.dtype,
+    unsupported_offload_mode: str | None = None,
+) -> tuple[LoRAModel, PEFTHelper, PikaSpec] | None:
+    """Load a manifest-identified Pika H3 Flex release as a dynamic BF16 LoRA.
+
+    The 624 FP32 factors (50 DiT blocks + 2 token-refiner blocks x 6 targets,
+    PEFT ``.lora_A.default.weight`` naming) use the same Diffusers module names
+    and shapes as Turbo, so Turbo's coverage check, QKV mapping and gate/up
+    packing apply unchanged. The manifest supplies rank = alpha = 128, i.e.
+    scaling 1.0. Factors are cast to BF16 and never merged into the base
+    weights (BF16 merging drops 27-57% of the update on sampled layers).
+    """
+    spec = read_pika_spec(lora_path)
+    if spec is None:
+        return None
+    if partition != spec.task:
+        raise ValueError(f"Pika {spec.task} requires a dedicated --task-type {spec.task} server, got {partition!r}")
+    if unsupported_offload_mode is not None:
+        raise ValueError(f"Pika dynamic LoRA does not support {unsupported_offload_mode}")
+    if dtype != torch.bfloat16:
+        raise ValueError(f"Pika H3 Flex requires BF16 resident dynamic LoRA factors, got {dtype}")
+    verify_pika_weights(spec)
+    with safe_open(spec.weights_path, framework="pt", device="cpu") as checkpoint:
+        tensors = _validate_and_convert_tensors(checkpoint, label="Pika H3 Flex")
+    peft_helper = PEFTHelper.from_dict(
+        {"r": PIKA_RANK, "lora_alpha": PIKA_ALPHA, "target_modules": _TURBO_TARGET_PATTERN}
+    )
+    lora_model = LoRAModel.from_lora_tensors(
+        lora_model_id=lora_request.lora_int_id,
+        tensors=tensors,
+        peft_helper=peft_helper,
+        device="cpu",
+        dtype=dtype,
+        weights_mapper=_TURBO_WEIGHTS_MAPPER,
+    )
+    _pack_h3_turbo_fc1(lora_model)
+    logger.info(
+        "Pika H3 Flex %s adapter %s (sha256 %s verified): %d tensors -> %d modules, rank=alpha=%d (scale 1.0), "
+        "BF16 dynamic LoRA",
+        spec.task,
+        spec.weights_path,
+        spec.sha256[:12],
+        len(tensors),
+        len(lora_model.loras),
+        PIKA_RANK,
     )
     return lora_model, peft_helper, spec
 

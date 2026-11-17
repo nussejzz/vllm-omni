@@ -23,8 +23,20 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class _PreparedEvaluation(tuple):
+    """``(rows, prepared, times, cond)`` that also carries the evaluation's grid sigmas."""
+
+    sigmas: tuple[float, ...]
+
+
 class MiniMaxH3Model:
-    """Translate sampler evaluations into H3 inputs and raw velocity into x0."""
+    """Translate sampler evaluations into H3 inputs and raw velocity into x0.
+
+    ``grid_sigma_x0`` selects ``x0 = x_t + sigma * v`` with the schedule's own
+    sigma (Pika H3 Flex, ``wrapper.py:252-262``). The default derives sigma from
+    the float32 timestep, ``1 - (1 - sigma)``, as the base H3 scheduler does;
+    the two differ by one ulp at some sigmas.
+    """
 
     def __init__(
         self,
@@ -36,11 +48,15 @@ class MiniMaxH3Model:
         model_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
         attention_schedule=None,
         attention_sigma_schedule=(),
+        grid_sigma_x0: bool = False,
     ):
         self.transformer, self.branch, self.rows = transformer, branch, rows
         self.attention_schedule = attention_schedule
         self.attention_sigma_schedule = attention_sigma_schedule
         self.edits, self.cond_timesteps = edits, cond_timesteps
+        self.grid_sigma_x0 = bool(grid_sigma_x0)
+        if self.grid_sigma_x0 and any(edit is not None for edit in edits):
+            raise ValueError("grid-sigma x0 does not support latent edits")
         # Fixed condition rows stay in this buffer; each prediction replaces
         # the target rows. Keep it for the entire request, including retries.
         self.model_rows = model_rows if model_rows is not None else tuple(row.clone() for row in rows)
@@ -70,10 +86,18 @@ class MiniMaxH3Model:
             if edit is not None:
                 row[mask], target_timesteps = edit.prepare(row[mask], t, c, sigma=sigma)
             prepared.append((row, target_timesteps))
-        return rows, prepared, times, cond
+        result = _PreparedEvaluation((rows, prepared, times, cond))
+        result.sigmas = tuple(float(sigma) for sigma in evaluation.sigmas)
+        return result
 
     def to_denoised(self, prepared, velocities):
         rows, model_rows, times, _ = prepared
+        if self.grid_sigma_x0:
+            # Pika: rows + float(sigma) * v.float(), a rounded multiply then a rounded add.
+            return tuple(
+                row[mask] + sigma * v.float()[mask]
+                for row, mask, sigma, v in zip(rows, self.masks, prepared.sigmas, velocities, strict=True)
+            )
         return tuple(
             minimax_h3_rf_v_to_x0(row[mask], v.float()[mask], row.new_tensor(t))
             if edit is None

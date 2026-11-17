@@ -93,6 +93,19 @@ def _load_component_config(component_path: str) -> dict[str, Any]:
     return config
 
 
+def _vae_build_dtype(build_fp32: bool) -> AbstractContextManager:
+    """FP32 default dtype while a VAE is constructed, when opted in.
+
+    ``minimax_h3_vae_build_fp32`` (off by default, keeping established base
+    outputs): the loader builds the pipeline under a BF16 default dtype, so FP32
+    checkpoint weights and constants created at construction (e.g. BigVGAN
+    anti-aliasing filters) are first materialized in BF16 and only later cast
+    back to FP32 by ``.to(dtype=torch.float32)``. Building under FP32 avoids
+    that rounding.
+    """
+    return set_default_torch_dtype(torch.float32) if build_fp32 else nullcontext()
+
+
 def _load_remote_component(
     component_path: str,
     config: dict[str, Any],
@@ -366,6 +379,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         decoder_source: str | Mapping[str, str] | None = None,
         lightvae_decoder_path: str | None = None,
         allow_decoder_compile: bool = False,
+        build_fp32: bool = False,
+        decode_fp32: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -373,6 +388,8 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         self.decode_only = bool(decode_only)
         if self.encode_only and self.decode_only:
             raise ValueError("MiniMax H3 video VAE cannot be both encode-only and decode-only")
+        if decode_fp32 and (decoder_source is not None or lightvae_decoder_path is not None):
+            raise ValueError("minimax_h3_vae_decode_fp32 applies to the checkpoint's own video decoder only")
         if lightvae_decoder_path is not None and decoder_source is not None:
             raise ValueError("lightvae_decoder_path cannot be combined with video_vae_decoder")
         from .vae_nvfp4 import (
@@ -390,7 +407,10 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         if self.encode_only:
             self.remote = _load_video_vae_encoder(component_path, self.config_dict)
         else:
-            self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
+            with _vae_build_dtype(build_fp32):
+                self.remote = _load_remote_component(
+                    component_path, self.config_dict, trust_remote_code=trust_remote_code
+                )
             if self.decode_only:
                 _remove_modules(self.remote.model, ("encoder", "quant_conv"))
             if lightvae_decoder_path is not None:
@@ -417,7 +437,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
             self.decode_dtype = torch.bfloat16
             self.remote.to(device=initial_device)
         decoder = getattr(self.remote.model, "decoder", None)
-        if decoder is not None and decoder_path is None:
+        if decode_fp32:
+            # Opt-in (``minimax_h3_vae_decode_fp32``): decode in FP32 without FP16
+            # autocast, as Pika H3 Flex does (``core/vae.py:49-73``). The CUDA
+            # fast path persists decoder linears in FP16, so it is skipped.
+            self.decode_dtype = torch.float32
+        elif decoder is not None and decoder_path is None:
             install_h3_vae_optimizations(
                 decoder,
                 device=device,
@@ -1372,6 +1397,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         encode_only: bool = False,
         decode_only: bool = False,
         trust_remote_code: bool = False,
+        build_fp32: bool = False,
     ) -> None:
         super().__init__()
         self._device_target = device
@@ -1384,7 +1410,10 @@ class MiniMaxH3AudioVAE(nn.Module):
         if self.encode_only:
             self.remote = _load_audio_vae_encoder(component_path, self.config_dict)
         else:
-            self.remote = _load_remote_component(component_path, self.config_dict, trust_remote_code=trust_remote_code)
+            with _vae_build_dtype(build_fp32):
+                self.remote = _load_remote_component(
+                    component_path, self.config_dict, trust_remote_code=trust_remote_code
+                )
             if self.decode_only:
                 _remove_modules(self.remote.model, ("encoder", "pre_block", "mean_proj"))
         # The checkpoint's audio VAE contract is FP32 for both reference

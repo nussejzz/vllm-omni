@@ -23,7 +23,7 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
-from vllm_omni.diffusion.sampler import SamplingState, sampler_object
+from vllm_omni.diffusion.sampler import RENOISE_SAMPLER, RenoiseNoiseSource, SamplingState, sampler_object
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit
@@ -336,6 +336,7 @@ def minimax_h3_denoise_loop(
     update_progress: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
+    noise_source: RenoiseNoiseSource | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -343,7 +344,12 @@ def minimax_h3_denoise_loop(
     conditional task, pass ``keyframe_cond_rows`` and/or ``audio_ref_rows`` to
     pin those rows across every step. The model's raw positive velocity is the
     update signal; MiniMax H3 only supports cfg-distilled checkpoints.
+
+    ``sampler="renoise"`` (Pika H3 Flex) requires the request's
+    ``noise_source``; x0 then uses the grid sigma.
     """
+    if (sampler == RENOISE_SAMPLER) != (noise_source is not None):
+        raise ValueError("the renoise sampler requires a request noise source, and only it uses one")
     if len(sigmas_video) != len(sigmas_audio):
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
@@ -393,8 +399,11 @@ def minimax_h3_denoise_loop(
         (video_rows, audio_rows),
         (video_edit, audio_edit),
         (imgvid_cond_noise_aug_for_inference, audio_cond_noise_aug_for_inference),
+        grid_sigma_x0=noise_source is not None,
     )
-    state = SamplingState((video_rows[update], audio_rows[audio_update]), (sigmas_video, sigmas_audio))
+    state = SamplingState(
+        (video_rows[update], audio_rows[audio_update]), (sigmas_video, sigmas_audio), history=noise_source
+    )
 
     def write_back_and_update_progress(state):
         nonlocal video_rows, audio_rows

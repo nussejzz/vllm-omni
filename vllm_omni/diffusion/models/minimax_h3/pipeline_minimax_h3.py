@@ -72,7 +72,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
-from vllm_omni.diffusion.sampler import SamplingState, resolve_sampler_name, sampler_object
+from vllm_omni.diffusion.sampler import RENOISE_SAMPLER, SamplingState, resolve_sampler_name, sampler_object
 from vllm_omni.diffusion.sched.sigma_schedule import DMD2SigmaSchedule
 from vllm_omni.diffusion.utils.media_utils import normalize_preencode_batch_frames, normalize_video_codec_options
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
@@ -171,7 +171,7 @@ from .latent_upscaler import (
     resolve_minimax_h3_latent_upscaler,
 )
 from .lightvae import resolve_h3_lightvae_decoder_path
-from .lora import TurboSpec, load_minimax_h3_native_adapter, load_minimax_h3_turbo_lora
+from .lora import TurboSpec, load_minimax_h3_native_adapter, load_minimax_h3_turbo_lora, load_pika_h3_lora
 from .minimax_h3_blocks import (
     MiniMaxH3Attention,
     _attention_isolates_packed_requests,
@@ -192,6 +192,22 @@ from .packed_tokens import (
     minimax_h3_patchify_video_latent,
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
+)
+from .pika import (
+    PIKA_AUDIO_SHIFT,
+    PIKA_AUGMENTATION_SEED_OFFSET,
+    PIKA_DUMP_DIR_ENV,
+    PIKA_INJECT_DIR_ENV,
+    PIKA_NOISE_VERSION,
+    PIKA_RENOISE_SEED_OFFSET,
+    PIKA_SERVED_TASKS,
+    PIKA_VIDEO_SHIFT,
+    PikaDebugDump,
+    PikaNoise,
+    PikaSpec,
+    describe_pika_sigmas,
+    load_pika_golden_conditioning,
+    read_pika_spec,
 )
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .regenerate import (
@@ -549,6 +565,36 @@ def _expose_padded_audio_tail(
     return model_mask.reshape(-1), restore_mask.reshape(-1)
 
 
+def _check_replicated_across_dit_ranks(*tensors: torch.Tensor, what: str) -> None:
+    """Fail loudly if device-drawn request noise differs between DiT ranks.
+
+    Pika draws its noise on each rank's own GPU (see ``PikaNoise``); SP and VAE
+    patch parallelism require every rank to hold identical rows. Two scalar
+    all-reduces per request; a no-op on one rank.
+    """
+    group, _, world_size = _dit_rank_world()
+    if world_size == 1:
+        return
+    fingerprint = torch.stack(
+        [value for tensor in tensors for value in (tensor.double().sum(), tensor.double().square().sum())]
+    )
+    high, low = fingerprint.clone(), fingerprint.clone()
+    dist.all_reduce(high, op=dist.ReduceOp.MAX, group=group)
+    dist.all_reduce(low, op=dist.ReduceOp.MIN, group=group)
+    if not torch.equal(high, low):
+        raise RuntimeError(
+            f"{what} differs across {world_size} DiT ranks; device RNG streams must match "
+            "(use identical GPU models in one SP group)"
+        )
+
+
+def _additional_flag(od_config: Any, key: str) -> bool:
+    value = (getattr(od_config, "additional_config", None) or {}).get(key, False)
+    if type(value) is not bool:
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
 def _resolve_minimax_h3_num_outputs(value: Any) -> int:
     if value is None:
         return 1
@@ -761,6 +807,9 @@ class MiniMaxH3Pipeline(
         self._turbo_lora_specs.pop(lora_request.lora_int_id, None)
         self._native_distilled_lora_adapter_ids.discard(lora_request.lora_int_id)
         self._lora_sigma_schedules.pop(lora_request.lora_int_id, None)
+        pika_lora_specs = getattr(self, "_pika_lora_specs", None)
+        if pika_lora_specs is not None:
+            pika_lora_specs.pop(lora_request.lora_int_id, None)
         od_config = getattr(self, "od_config", None)
         offload_modes = []
         if od_config is not None:
@@ -770,6 +819,31 @@ class MiniMaxH3Pipeline(
                     offload_modes.append("model-level CPU offload")
                 elif resolved_offload.strategy is OffloadStrategy.LAYER_WISE:
                     offload_modes.append("layerwise offload")
+        requested_pika = read_pika_spec(lora_path)
+        if requested_pika is not None:
+            startup = getattr(self, "_pika_spec", None)
+            if startup is None or os.path.realpath(startup.weights_path) != os.path.realpath(
+                requested_pika.weights_path
+            ):
+                # The Pika contract (sampler, noise streams, TF32 policy) is a
+                # server mode; a request-level Pika LoRA would run under Euler.
+                raise ValueError(
+                    "Pika H3 Flex adapters are served as the startup --lora-path of a dedicated server, "
+                    "not as request-level LoRAs"
+                )
+            if pika_lora_specs is None:
+                raise ValueError("Pika H3 Flex adapter loaded before the pipeline was initialized")
+            pika_loaded = load_pika_h3_lora(
+                partition=self.partition,
+                lora_request=lora_request,
+                lora_path=lora_path,
+                dtype=dtype,
+                unsupported_offload_mode=" or ".join(offload_modes) or None,
+            )
+            assert pika_loaded is not None
+            lora_model, peft_helper, pika_spec = pika_loaded
+            pika_lora_specs[lora_request.lora_int_id] = pika_spec
+            return lora_model, peft_helper
         loaded = load_minimax_h3_turbo_lora(
             partition=self.partition,
             lora_request=lora_request,
@@ -812,6 +886,19 @@ class MiniMaxH3Pipeline(
         lora_model: LoRAModel,
         bound_lora_names: frozenset[str],
     ) -> None:
+        if lora_model.id in getattr(self, "_pika_lora_specs", {}):
+            missing = sorted(set(lora_model.loras) - bound_lora_names)
+            if missing:
+                raise ValueError(
+                    "Pika H3 Flex LoRA binding is incomplete: "
+                    f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
+                )
+            logger.info(
+                "Pika H3 Flex LoRA bound %d/%d modules (dynamic, scale 1.0)",
+                len(bound_lora_names),
+                len(lora_model.loras),
+            )
+            return
         if lora_model.id in self._turbo_lora_specs:
             missing = sorted(set(lora_model.loras) - bound_lora_names)
             if missing:
@@ -828,6 +915,80 @@ class MiniMaxH3Pipeline(
                 "MiniMax-H3 native LoRA binding is incomplete: "
                 f"bound={len(bound_lora_names)}/{len(lora_model.loras)}, missing={missing[:5]}"
             )
+
+    def _resolve_startup_pika(self, od_config: OmniDiffusionConfig, *, modular: bool) -> PikaSpec | None:
+        """Claim ``--lora-path`` when it names a Pika H3 Flex release directory.
+
+        The server then runs Pika's contract for every request: the adapter is
+        the pipeline's fixed, pinned dynamic LoRA at scale 1, and requests are
+        sampled with the six-step re-noising ladder and Pika's noise streams.
+        Without such a ``--lora-path`` nothing here changes base H3 behavior.
+        """
+        lora_path = getattr(od_config, "lora_path", None)
+        if isinstance(lora_path, (list, tuple)):
+            if len(lora_path) != 1:
+                if any(read_pika_spec(path) is not None for path in lora_path):
+                    raise ValueError("Pika H3 Flex must be the only --lora-path adapter")
+                return None
+            lora_path = lora_path[0]
+        if not lora_path:
+            return None
+        spec = read_pika_spec(lora_path)
+        if spec is None:
+            return None
+        if spec.task not in PIKA_SERVED_TASKS:
+            raise ValueError(f"Pika H3 Flex {spec.task} is not ported to vLLM-Omni yet; serve the ref2va adapter")
+        if self.partition != spec.task:
+            raise ValueError(
+                f"Pika H3 Flex {spec.task} requires --task-type {spec.task}, got partition {self.partition!r}"
+            )
+        if modular or any(schedule is not None for schedule in self._base_schedule_by_partition.values()):
+            raise ValueError("Pika H3 Flex requires the original MiniMax-H3 base checkpoint, not a distilled one")
+        lora_scale = getattr(od_config, "lora_scale", 1.0)
+        if isinstance(lora_scale, (list, tuple)):
+            lora_scale = lora_scale[0] if len(lora_scale) == 1 else None
+        if lora_scale is None or float(lora_scale) != 1.0:
+            raise ValueError("Pika H3 Flex runs its adapter at scale 1; remove --lora-scale")
+        if getattr(od_config, "lora_application", "runtime") != "runtime":
+            raise ValueError(
+                "Pika H3 Flex requires dynamic (runtime) LoRA; merging into BF16 weights drops most of the update"
+            )
+        lora_backend = getattr(od_config, "lora_backend", None)
+        if lora_backend is not None and str(getattr(lora_backend, "value", lora_backend)).lower() != "peft":
+            raise ValueError("Pika H3 Flex requires lora_backend=peft (dynamic LoRA)")
+        # Pika's inference numerics policy (``core/numerics.py:29-41``): no TF32
+        # for FP32 matmuls (FP32 proj_in/proj_out/time embedder, VAE linears),
+        # TF32 allowed for cuDNN convolutions. These are PyTorch's defaults; the
+        # dedicated server pins them for its worker process.
+        previous = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = True
+        # The LoRA manager reads this per instance: the startup adapter becomes
+        # the pinned adapter of every request, always at scale 1.
+        self.diffusion_lora_fixed_adapter = True
+        logger.info(
+            "Pika H3 Flex server mode: %s %s (%s, %s), %d re-noising steps, sigmas %s, TF32 matmul/cudnn %s -> %s",
+            spec.release_id,
+            spec.weights_path,
+            spec.numerics_policy,
+            PIKA_NOISE_VERSION,
+            spec.denoise_steps,
+            describe_pika_sigmas(),
+            previous,
+            (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32),
+        )
+        return spec
+
+    def _validate_pika_request(self, sampling: Any, task: str) -> PikaSpec | None:
+        """The Pika spec this request runs under, after checking its options; None on base servers."""
+        spec = getattr(self, "_pika_spec", None)
+        if spec is None:
+            return None
+        try:
+            spec.check_request(sampling, task, step_execution=bool(getattr(self.od_config, "step_execution", False)))
+        except (TypeError, ValueError) as exc:
+            raise OmniClientError(str(exc)) from exc
+        return spec
 
     def _active_turbo_spec(self, sampling: Any) -> TurboSpec | None:
         """Return the spec of the Turbo adapter this request actually applies.
@@ -1044,6 +1205,8 @@ class MiniMaxH3Pipeline(
         self._turbo_lora_specs: dict[int, TurboSpec] = {}
         self._native_distilled_lora_adapter_ids: set[int] = set()
         self._lora_sigma_schedules: dict[int, DMD2SigmaSchedule] = {}
+        self._pika_lora_specs: dict[int, PikaSpec] = {}
+        self._pika_spec: PikaSpec | None = None
         model_root = _resolve_minimax_h3_model_root(
             str(od_config.model),
             od_config.revision,
@@ -1103,6 +1266,7 @@ class MiniMaxH3Pipeline(
         self._base_schedule_by_partition = {expected_partition: _read_base_schedule(release)}
         if ref2va_model_path is not None:
             self._base_schedule_by_partition["ref2va"] = _read_base_schedule(ref2va_release)
+        self._pika_spec = self._resolve_startup_pika(od_config, modular=modular)
 
         encoder_model_path = (
             vae_model_path
@@ -1320,6 +1484,14 @@ class MiniMaxH3Pipeline(
         self.audio_vae = None
         if self.load_vae_decoder:
             lightvae_decoder_path = resolve_h3_lightvae_decoder_path(od_config.additional_config or {})
+            vae_build_fp32 = _additional_flag(od_config, "minimax_h3_vae_build_fp32")
+            vae_decode_fp32 = _additional_flag(od_config, "minimax_h3_vae_decode_fp32")
+            if vae_build_fp32 or vae_decode_fp32:
+                logger.info(
+                    "MiniMax H3 VAE numerics: build_fp32=%s decode_fp32=%s (opt-in; defaults keep base outputs)",
+                    vae_build_fp32,
+                    vae_decode_fp32,
+                )
             self.video_vae = MiniMaxH3VideoVAE(
                 os.path.join(vae_model_path, "video_vae"),
                 device=self.device,
@@ -1338,6 +1510,8 @@ class MiniMaxH3Pipeline(
                     bool(od_config.enforce_eager),
                     current_omni_platform,
                 ),
+                build_fp32=vae_build_fp32,
+                decode_fp32=vae_decode_fp32,
             )
             self.audio_vae = MiniMaxH3AudioVAE(
                 os.path.join(vae_model_path, "audio_vae"),
@@ -1345,6 +1519,7 @@ class MiniMaxH3Pipeline(
                 load_device=component_load_device,
                 decode_only=not self.load_vae_encoder,
                 trust_remote_code=od_config.trust_remote_code,
+                build_fp32=vae_build_fp32,
             )
         # Registry-side VAE patch-parallel discovery uses ``pipeline.vae``.
         self.vae = self.video_vae
@@ -1555,6 +1730,10 @@ class MiniMaxH3Pipeline(
         derived from the step count, together with the count the rest of the
         request speaks in.
         """
+        pika = getattr(self, "_pika_spec", None)
+        if pika is not None:
+            # Pika's knots; the per-modality shifted ladders are built by pika_sigmas().
+            return pika.base_schedule, pika.denoise_steps
         if self._fasth3 is not None:
             # A fused student carries its own positions; the checkpoint
             # underneath it is the many-step teacher, whose schedule does not
@@ -2049,6 +2228,7 @@ class MiniMaxH3Pipeline(
         refine: MiniMaxH3LatentRefineSpec | None = None,
         precomputed_initial_noise: tuple[torch.Tensor, torch.Tensor] | None = None,
         precomputed_visual_condition_noise: torch.Tensor | None = None,
+        pika: PikaSpec | None = None,
     ) -> dict[str, Any]:
         """Build the packed layout, initial rows, anchors, and sigma schedules.
 
@@ -2058,33 +2238,78 @@ class MiniMaxH3Pipeline(
         ``init_latents`` and ``refine`` turn the pass into a second, partial
         one: the rows start from those latents re-noised to the schedule
         position ``refine`` selects, and the returned schedules begin there.
+
+        ``pika`` selects Pika H3 Flex: its float32 ladders, the re-noising
+        sampler and request-owned device noise (initial ``seed``, re-noise
+        ``seed + 1``, reference augmentation ``seed + 7919``).
         """
-        sampler = resolve_sampler_name(sampler)
-        if sampler != "euler" and base_schedule is not None:
-            raise ValueError(
-                f"MiniMax H3 {sampler} sampling with a fixed distilled sigma schedule has not been validated; "
-                "use sampler='euler' for this schedule."
-            )
-        video_sigmas = minimax_h3_time_shift_sigmas(
-            num_steps=num_steps,
-            shift_scale=video_shift,
-            base_schedule=base_schedule,
-        )
-        audio_sigmas = minimax_h3_time_shift_sigmas(
-            num_steps=num_steps,
-            shift_scale=audio_shift,
-            base_schedule=base_schedule,
-        )
-        if precomputed_initial_noise is None:
-            initial_video, initial_audio = self._initial_noise(
+        noise_source: PikaNoise | None = None
+        if pika is not None:
+            unsupported = {
+                "latent editing": video_edit_clean_rows is not None or audio_edit_clean_rows is not None,
+                "driving audio (audio_mode=lock_source)": locked_audio_rows is not None,
+                "latent refine / init latents": init_latents is not None or refine is not None,
+                "control conditioning": control_rows is not None,
+                "timeline guides / continuation": bool(guide_blocks) or temporal_offset != 0.0,
+            }
+            rejected = [name for name, present in unsupported.items() if present]
+            if rejected:
+                raise OmniClientError(f"{pika.name} does not support {', '.join(rejected)}")
+            if num_steps != pika.denoise_steps:
+                raise ValueError(f"{pika.name} runs {pika.denoise_steps} steps, got {num_steps}")
+            sampler = RENOISE_SAMPLER
+            video_sigmas = pika.video_sigmas
+            audio_sigmas = pika.audio_sigmas
+            # Every SP rank draws the same full tensors on its own device; see PikaNoise.
+            noise_source = PikaNoise(
                 seed=seed,
+                device=self.device,
                 latent_t=latent_t,
                 latent_h=latent_h,
                 latent_w=latent_w,
                 audio_t=audio_t,
             )
+            initial_video, initial_audio = noise_source.initial_rows()
+            _check_replicated_across_dit_ranks(initial_video, initial_audio, what=f"{pika.name} initial noise")
+            logger.info(
+                "%s request: seed=%d noise=%s (initial %d, re-noise %d, augmentation %d), video rows %s, audio rows %s",
+                pika.name,
+                seed,
+                PIKA_NOISE_VERSION,
+                noise_source.seed,
+                noise_source.seed + PIKA_RENOISE_SEED_OFFSET,
+                noise_source.seed + PIKA_AUGMENTATION_SEED_OFFSET,
+                tuple(initial_video.shape),
+                tuple(initial_audio.shape),
+            )
         else:
-            initial_video, initial_audio = precomputed_initial_noise
+            sampler = resolve_sampler_name(sampler)
+            if sampler != "euler" and base_schedule is not None:
+                raise ValueError(
+                    f"MiniMax H3 {sampler} sampling with a fixed distilled sigma schedule has not been validated; "
+                    "use sampler='euler' for this schedule."
+                )
+            video_sigmas = minimax_h3_time_shift_sigmas(
+                num_steps=num_steps,
+                shift_scale=video_shift,
+                base_schedule=base_schedule,
+            )
+            audio_sigmas = minimax_h3_time_shift_sigmas(
+                num_steps=num_steps,
+                shift_scale=audio_shift,
+                base_schedule=base_schedule,
+            )
+        if noise_source is None:
+            if precomputed_initial_noise is None:
+                initial_video, initial_audio = self._initial_noise(
+                    seed=seed,
+                    latent_t=latent_t,
+                    latent_h=latent_h,
+                    latent_w=latent_w,
+                    audio_t=audio_t,
+                )
+            else:
+                initial_video, initial_audio = precomputed_initial_noise
         if init_latents is not None:
             if refine is None:
                 raise ValueError("init_latents needs a refine spec to place them on the schedule")
@@ -2171,22 +2396,28 @@ class MiniMaxH3Pipeline(
                 condition_shapes = [visual_condition_shape]
             if not condition_shapes:
                 raise ValueError("visual condition shape is missing")
-            visual_anchor = minimax_h3_imgvid_cond_noise_aug_rows(
-                visual_anchor,
-                condition_shapes=condition_shapes,
-                target_latent_t=latent_t,
-                imgvid_cond_num_frames=len(condition_shapes),
-                seed=seed,
-                noise_aug=MINIMAX_H3_IMGVID_COND_TIMESTEP,
-                precomputed_noise_rows=precomputed_visual_condition_noise,
-                guided=bool(guide_blocks),
-            )
+            if noise_source is not None:
+                assert pika is not None
+                # Pika draws one augmentation tensor per visual reference, in packed order.
+                visual_anchor = noise_source.visual_anchor(visual_anchor, condition_shapes, pika.conditioning_dtype)
+            else:
+                visual_anchor = minimax_h3_imgvid_cond_noise_aug_rows(
+                    visual_anchor,
+                    condition_shapes=condition_shapes,
+                    target_latent_t=latent_t,
+                    imgvid_cond_num_frames=len(condition_shapes),
+                    seed=seed,
+                    noise_aug=MINIMAX_H3_IMGVID_COND_TIMESTEP,
+                    precomputed_noise_rows=precomputed_visual_condition_noise,
+                    guided=bool(guide_blocks),
+                )
             full_video = torch.zeros(
                 branch.img_pos.shape[0],
                 96,
                 dtype=torch.float32,
+                device=initial_video.device,
             )
-            full_video[branch.update_mask] = initial_video
+            full_video[branch.update_mask.to(initial_video.device)] = initial_video
             initial_video = full_video
 
         if locked_audio_rows is not None:
@@ -2214,8 +2445,9 @@ class MiniMaxH3Pipeline(
                 branch.audio_pos.shape[0],
                 32,
                 dtype=torch.float32,
+                device=initial_audio.device,
             )
-            full_audio[branch.audio_update_mask] = initial_audio
+            full_audio[branch.audio_update_mask.to(initial_audio.device)] = initial_audio
             initial_audio = full_audio
 
         video_edit = None
@@ -2262,6 +2494,7 @@ class MiniMaxH3Pipeline(
             initial_audio[branch.audio_update_mask] *= audio_sigmas[0]
         return {
             "branch": branch,
+            "noise_source": noise_source,
             # The request-mode loop moves these onto the device itself; step mode
             # keeps them resident across steps, so normalize once for both.
             "video_rows": initial_video.to(device=self.device, dtype=torch.float32),
@@ -2351,10 +2584,21 @@ class MiniMaxH3Pipeline(
         init_latents: tuple[torch.Tensor, torch.Tensor] | None = None,
         refine: MiniMaxH3LatentRefineSpec | None = None,
         request_context: dict[str, Any] | None = None,
+        pika: PikaSpec | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        inject = os.environ.get(PIKA_INJECT_DIR_ENV) if pika is not None else None
+        if inject:
+            golden_text, golden_visual = load_pika_golden_conditioning(
+                inject, text_tags=text_tags, visual_condition=visual_condition
+            )
+            logger.warning("Pika parity mode: injecting golden conditioning from %s", inject)
+            text_embeddings = golden_text.to(device=text_embeddings.device, dtype=text_embeddings.dtype)
+            if golden_visual is not None:
+                visual_condition = golden_visual.to(device=visual_condition.device, dtype=visual_condition.dtype)
         # Consume request-owned noise here so caller keyword dictionaries cannot
         # keep the host buffers alive throughout denoising.
         inputs = self._build_denoise_inputs(
+            pika=pika,
             sampler=sampler,
             task=task,
             text_embeddings=text_embeddings,
@@ -2409,10 +2653,41 @@ class MiniMaxH3Pipeline(
         cache_runtime = getattr(self, "_cache_dit_runtime", None)
         if cache_runtime is not None:
             cache_runtime.refresh(len(inputs["sigmas_video"]) - 1)
+        dump = (
+            PikaDebugDump(os.environ.get(PIKA_DUMP_DIR_ENV), rank=getattr(self, "_dit_rank", 0), seed=seed)
+            if pika is not None
+            else None
+        )
+        if dump:
+            dump.save(
+                "00_inputs",
+                text_embeddings=text_embeddings,
+                text_tags=text_tags,
+                visual_condition=visual_condition,
+                visual_condition_shapes=visual_condition_shapes or [visual_condition_shape],
+                cond_anchor=inputs["cond_anchor"],
+                audio_anchor=inputs["audio_anchor"],
+                video_rows=inputs["video_rows"],
+                audio_rows=inputs["audio_rows"],
+                update_mask=branch.update_mask,
+                audio_update_mask=branch.audio_update_mask,
+                sigmas_video=inputs["sigmas_video"],
+                sigmas_audio=inputs["sigmas_audio"],
+                seq_len=branch.seq_len,
+                used_len=branch.used_len,
+                text_len=branch.text_len,
+            )
+
+        def on_step(step: int, video: torch.Tensor, audio: torch.Tensor) -> None:
+            if dump:
+                dump.save(f"01_step{step}_rows", video_rows=video, audio_rows=audio)
+            progress.update()
+
         with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
             with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
                 video_rows, audio_rows = minimax_h3_denoise_loop(
                     sampler=inputs["sampler"],
+                    noise_source=inputs["noise_source"],
                     model=transformer,
                     positive=branch,
                     initial_video_rows=inputs["video_rows"],
@@ -2426,7 +2701,7 @@ class MiniMaxH3Pipeline(
                     audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
                     video_edit=inputs["video_edit"],
                     audio_edit=inputs["audio_edit"],
-                    update_progress=lambda step, video, audio: progress.update(),
+                    update_progress=on_step,
                 )
 
         return self._unpack_denoised_rows(
@@ -2517,7 +2792,7 @@ class MiniMaxH3Pipeline(
                 with current_omni_platform.create_autocast_context(
                     device_type=self.device.type,
                     dtype=self.video_vae.decode_dtype,
-                    enabled=True,
+                    enabled=self.video_vae.decode_dtype != torch.float32,
                 ):
                     videos = decode_chunks_to_mp4(
                         self.video_vae, video_latent, session=session, frame_counts=frame_counts
@@ -2568,7 +2843,7 @@ class MiniMaxH3Pipeline(
             with current_omni_platform.create_autocast_context(
                 device_type=self.device.type,
                 dtype=self.video_vae.decode_dtype,
-                enabled=True,
+                enabled=self.video_vae.decode_dtype != torch.float32,
             ):
                 video = self.video_vae.decode_latent(video_latent)
         video = video[..., :height, :width].contiguous()
@@ -2998,6 +3273,7 @@ class MiniMaxH3Pipeline(
                     self._validate_turbo_sampling(sampling, turbo_spec)
                 if has_native_lora:
                     self._validate_native_sampling(sampling, task=task)
+                pika = self._validate_pika_request(sampling, task)
                 if self._fasth3 is not None:
                     self._fasth3.check_request(
                         sampling,
@@ -3043,6 +3319,7 @@ class MiniMaxH3Pipeline(
                 if (
                     request_context is not None
                     and task == "ref2va"
+                    and pika is None  # Pika draws its own noise on the device
                     and continuation is None
                     and resolve_continuation_request(sampling.extra_args or {}) is None
                 ):
@@ -3239,6 +3516,18 @@ class MiniMaxH3Pipeline(
             self._validate_turbo_sampling(sampling, turbo_spec)
         if has_native_lora:
             self._validate_native_sampling(sampling, task=task)
+        pika = self._validate_pika_request(sampling, task)
+        if pika is not None and (
+            control is not None
+            or continuation is not None
+            or conditioning.guide_blocks
+            or conditioning.video_edit_clean_rows is not None
+            or conditioning.audio_edit_clean_rows is not None
+        ):
+            raise OmniClientError(
+                f"{pika.name} supports plain Ref2VA requests only: no control, continuation, timeline guides "
+                "or latent-mask editing"
+            )
         if self._fasth3_checkpoint is not None:
             self._fasth3_checkpoint.check_request(
                 sampling,
@@ -3384,8 +3673,8 @@ class MiniMaxH3Pipeline(
 
         self._prepare_adaln_adapter(sampling)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
-        sampler = resolve_sampler_name(extra.get("sampler"))
-        if sampler != "euler" and base_schedule is not None:
+        sampler = RENOISE_SAMPLER if pika is not None else resolve_sampler_name(extra.get("sampler"))
+        if pika is None and sampler != "euler" and base_schedule is not None:
             raise ValueError(
                 f"MiniMax H3 {sampler} sampling with a fixed distilled sigma schedule has not been validated; "
                 "use sampler='euler' for this schedule."
@@ -3425,6 +3714,8 @@ class MiniMaxH3Pipeline(
         )
         if continuation is not None and quality_plan.cache_dit is not None:
             raise OmniClientError("MiniMax H3 continuation requires uncached denoising; set quality=lossless")
+        if pika is not None and quality_plan.cache_dit is not None:
+            raise OmniClientError(f"{pika.name} requires uncached denoising (all six forwards); set quality=lossless")
         if (attention_schedule or sigma_schedule) and quality_plan.cache_dit is not None:
             # Cache-DiT reuses transformer outputs across steps, so a cached residual can come from a step
             # that ran a different attention profile. Reject before its hooks are installed. An empty list
@@ -3451,6 +3742,11 @@ class MiniMaxH3Pipeline(
             extra, latent_h=conditioning.height // 16, latent_w=conditioning.width // 16
         )
         latent_refine = self._resolve_latent_refine(extra)
+        if pika is not None and (latent_refine is not None or latent_continuation is not None):
+            raise OmniClientError(
+                f"{pika.name} runs its full released schedule; latent_refine and continue_from are unsupported "
+                "(latent_upscale alone is allowed)"
+            )
         if latent_refine is not None:
             if (
                 control_rows is not None
@@ -3546,9 +3842,14 @@ class MiniMaxH3Pipeline(
             "seed": int(sampling.seed if sampling.seed is not None else 42),
             "sampler": sampler,
             "num_steps": num_steps,
-            "video_shift": float(extra.get("flow_shift", self.default_video_shift)),
-            "audio_shift": float(extra.get("audio_flow_shift", self.default_audio_shift)),
+            "video_shift": (
+                PIKA_VIDEO_SHIFT if pika is not None else float(extra.get("flow_shift", self.default_video_shift))
+            ),
+            "audio_shift": (
+                PIKA_AUDIO_SHIFT if pika is not None else float(extra.get("audio_flow_shift", self.default_audio_shift))
+            ),
             "base_schedule": base_schedule,
+            "pika": pika,
             "num_outputs": num_outputs,
             "preencode_mp4": bool(extra.get("preencode_mp4", False)),
             "preencode_batch_frames": (
@@ -3865,10 +4166,13 @@ class MiniMaxH3Pipeline(
     @staticmethod
     def _denoise_kwargs(context: dict[str, Any]) -> dict[str, Any]:
         """Select the denoise-input arguments from a prepared request context."""
-        return {
+        kwargs = {
             **{key: context[key] for key in _MINIMAX_H3_DENOISE_INPUT_KEYS},
             "sampler": context.get("sampler", "euler"),
         }
+        if context.get("pika") is not None:
+            kwargs["pika"] = context["pika"]
+        return kwargs
 
     @torch.no_grad()
     def forward(self, request: DiffusionRequestBatch) -> DiffusionOutput:
@@ -4190,6 +4494,8 @@ class MiniMaxH3Pipeline(
                 _STEP_SAMPLING_STATE: SamplingState(
                     (video_rows[branch.update_mask_dev], audio_rows[branch.audio_update_mask_dev]),
                     (sigmas_video, sigmas_audio),
+                    # Pika: the request's PikaNoise is the re-noise sampler's history.
+                    history=inputs.get("noise_source"),
                 ),
                 _STEP_VIDEO_EDIT: inputs.get("video_edit"),
                 _STEP_AUDIO_EDIT: inputs.get("audio_edit"),
@@ -4255,6 +4561,7 @@ class MiniMaxH3Pipeline(
                         model_rows=request.extra.get(_STEP_MODEL_ROWS),
                         attention_schedule=request.attention_schedule,
                         attention_sigma_schedule=request.attention_sigma_schedule,
+                        grid_sigma_x0=name == RENOISE_SAMPLER,
                     )
                     request.extra[_STEP_MODEL_ROWS] = adapter.model_rows
                     models[sample] = adapter
