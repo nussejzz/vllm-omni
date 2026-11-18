@@ -95,8 +95,10 @@ def _norm_silu_conv(norm: nn.GroupNorm, conv: nn.Conv3d, x: torch.Tensor) -> tor
         # ``_merge_time_to_batch`` and the non-parallel GroupNorm forward; the
         # split back to BCTHW stays a strided view read by the kernel.
         merged = x.permute(0, 2, 1, 3, 4).contiguous().view(batch * frames, channels, 1, height, width)
-        normalized = nn.GroupNorm.forward(norm, merged)
-        source = normalized.view(batch, frames, channels, height, width).permute(0, 2, 1, 3, 4)
+        source = nn.GroupNorm.forward(norm, merged)
+        # The checkpoint norm frees its merged copy on return; so does this.
+        del merged
+        source = source.view(batch, frames, channels, height, width).permute(0, 2, 1, 3, 4)
     else:
         source = nn.GroupNorm.forward(norm, x)
     front, pad_h, pad_w = _causal_padding(conv, frames)
@@ -106,6 +108,9 @@ def _norm_silu_conv(norm: nn.GroupNorm, conv: nn.Conv3d, x: torch.Tensor) -> tor
     if padded is None:
         # ``_split_time_from_batch`` then the checkpoint's activation and conv.
         return conv(F.silu(source.contiguous()))
+    # Only the padded input stays alive across the convolution, where the
+    # checkpoint keeps the activation and the padded copy.
+    del source
     return _conv_padded(conv, padded)
 
 

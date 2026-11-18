@@ -490,6 +490,13 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 logger.info("MiniMax-H3 VAE encoder fusion disabled by %s=0", _VAE_ENCODER_FUSION_ENV)
             elif install_h3_vae_encoder_fusion(encoder, device=device):
                 logger.info("MiniMax-H3 VAE encoder fusion installed")
+            else:
+                # Not an error: the checkpoint encoder forwards run unchanged.
+                logger.info(
+                    "MiniMax-H3 VAE encoder fusion not installed: no exact operator for %s "
+                    "or the checkpoint encoder is outside its contract",
+                    device,
+                )
         # The three decoder fast paths below are XPU-only: they were written
         # against the XPU kernels/compile stack and validated there. CUDA keeps
         # its own fused-operator path (install_h3_vae_optimizations above); on

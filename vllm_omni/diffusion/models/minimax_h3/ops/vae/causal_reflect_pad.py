@@ -148,6 +148,9 @@ def try_causal_reflect_pad_exact(
         and not torch.is_grad_enabled()
         and not torch.compiler.is_compiling()
         and source.is_cuda
+        # Triton launches on the current device; a tensor on another device
+        # keeps the reference path.
+        and source.device.index == torch.accelerator.current_device_index()
         and source.dtype == torch.float32
         and source.ndim == 5
         and source.numel() > 0
@@ -158,6 +161,9 @@ def try_causal_reflect_pad_exact(
     # ``reflect`` requires each pad to be smaller than its dimension; the
     # checkpoint path raises there, so keep that error on the reference path.
     if max(top, bottom) >= height or max(left, right) >= width:
+        return None
+    # Column offsets are formed in 32-bit lanes before the 64-bit row base.
+    if (width - 1) * source.stride(4) >= 2**31:
         return None
 
     output_frames = frames + front

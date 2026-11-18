@@ -110,6 +110,45 @@ def test_fused_padding_rejects_inputs_outside_its_contract():
         assert pad_op(source.requires_grad_(), **pads) is None
 
 
+def test_fused_padding_declines_a_tensor_off_the_current_device():
+    device, pad_op = _pad_operator()
+    if device.type != "cuda" or torch.accelerator.device_count() < 2:
+        pytest.skip("Needs two CUDA devices")
+    other = torch.device("cuda", (torch.accelerator.current_device_index() + 1) % torch.accelerator.device_count())
+    source = torch.randn(1, 2, 3, 4, 5, device=other)
+    pads = {"front": 2, "top": 1, "bottom": 1, "left": 1, "right": 1, "apply_silu": True}
+
+    with torch.inference_mode():
+        assert pad_op(source, **pads) is None
+        with torch.accelerator.device_index(other.index):
+            _assert_same_bits(pad_op(source, **pads), _checkpoint_chain(source, **pads))
+
+
+def test_fused_encoder_peak_memory_stays_below_checkpoint():
+    device, _pad_op = _pad_operator()
+    if device.type != "cuda":
+        pytest.skip("Peak-memory statistics are read from the CUDA allocator")
+    reference = make_encoder().to(device)
+    fused = copy.deepcopy(reference)
+    assert install_h3_vae_encoder_fusion(fused, device=device)
+    x = torch.randn(1, 3, 17, 128, 128, device=device)
+
+    def peak(encoder):
+        with torch.inference_mode():
+            encoder(x)  # warm the kernels and the allocator
+            torch.accelerator.synchronize(device)
+            torch.accelerator.reset_peak_memory_stats(device)
+            base = torch.accelerator.memory_allocated(device)
+            encoder(x)
+            torch.accelerator.synchronize(device)
+            return torch.accelerator.max_memory_allocated(device) - base
+
+    # The fused forwards must not hold the GroupNorm copies across the
+    # convolution, so they never keep more full-size tensors alive than the
+    # checkpoint path does.
+    assert peak(fused) <= peak(reference)
+
+
 @pytest.mark.parametrize("time_isolated", [True, False])
 def test_fused_encoder_matches_checkpoint_forward(time_isolated):
     device, pad_op = _pad_operator()
