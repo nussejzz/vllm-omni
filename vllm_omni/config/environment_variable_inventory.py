@@ -273,6 +273,9 @@ _MODEL_INTERNALIZE = (
     # MiniMax-H3: transitional rollback/A-B switch for direct reference-video
     # frame decoding (0 = lossless prepared.mp4 round trip).
     "VLLM_OMNI_H3_REFERENCE_DECODE_WORKERS",
+    # MiniMax-H3: transitional rollback/A-B switch for bit-reproducible audio
+    # VAE decoding (0 = cuDNN heuristic ConvTranspose1d path).
+    "VLLM_OMNI_H3_DETERMINISTIC_AUDIO",
     # MiniMax-H3: transitional rollback/A-B switch for stage-boundary allocator
     # releases without a DLO component cache (force = empty_cache every time).
     "VLLM_OMNI_H3_STAGE_CACHE_RELEASE",

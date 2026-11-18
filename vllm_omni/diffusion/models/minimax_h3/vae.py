@@ -7,6 +7,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import types
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
@@ -113,6 +114,126 @@ def _encoder_fusion_enabled() -> bool:
     if value not in ("0", "1"):
         raise ValueError(f"{_VAE_ENCODER_FUSION_ENV} must be 0 or 1, got {value!r}")
     return value == "1"
+
+
+# Transitional rollback/A-B switch for bit-reproducible waveform decoding.
+# BigVGAN's anti-aliased activations upsample with a stride-2 depthwise
+# ConvTranspose1d. For the narrow late stages cuDNN's heuristic selects its
+# legacy dgrad engine, which launches one kernel per channel over internal side
+# streams and accumulates with atomics, so equal latents decode to waveforms
+# about 110 dB apart and the lossy AAC mux turns that into ~27 dB PCM
+# differences. Unset or "1": every remote ``UpSample1d`` runs as polyphase
+# depthwise conv1d (the same products and per-sample sums in a fixed order),
+# and the rest of the decode is held to deterministic cuDNN algorithms. "0"
+# restores the checkpoint's heuristic path.
+MINIMAX_H3_DETERMINISTIC_AUDIO_ENV = "VLLM_OMNI_H3_DETERMINISTIC_AUDIO"
+
+
+def _deterministic_audio_enabled() -> bool:
+    raw = os.environ.get(MINIMAX_H3_DETERMINISTIC_AUDIO_ENV, "").strip()
+    if raw in ("", "1"):
+        return True
+    if raw == "0":
+        return False
+    raise ValueError(f"{MINIMAX_H3_DETERMINISTIC_AUDIO_ENV} must be '1' or '0', got {raw!r}")
+
+
+# Reject an invalid switch value when the model is imported.
+_deterministic_audio_enabled()
+
+
+def _polyphase_upsample1d_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Remote ``UpSample1d.forward`` without the transposed convolution.
+
+    The remote upsampler is ``ratio * conv_transpose1d(pad(x), filter,
+    stride=ratio, groups=C)`` cropped by ``pad_left``/``pad_right``. Output
+    sample ``ratio * m + p`` of that convolution sums the ``k / ratio`` products
+    of padded inputs ``m - j`` with taps ``filter[p + ratio * j]``, which a
+    depthwise conv1d over the reversed phase taps evaluates in a fixed order.
+    """
+    channels = x.shape[1]
+    ratio = int(self.ratio)
+    taps = int(self.filter.shape[-1]) // ratio
+    key = (channels, x.device, x.dtype)
+    cache = self.__dict__.setdefault("_h3_polyphase_weights", {})
+    weight = cache.get(key)
+    if weight is None:
+        kernel = self.filter.reshape(-1).to(device=x.device, dtype=x.dtype)
+        phases = torch.stack([kernel[phase::ratio].flip(0) for phase in range(ratio)])
+        # Output channel c * ratio + phase reads input channel c.
+        weight = phases.repeat(channels, 1).unsqueeze(1).contiguous()
+        cache[key] = weight
+    x = nn.functional.pad(x, (self.pad, self.pad), mode="replicate")
+    phased = nn.functional.conv1d(nn.functional.pad(x, (taps - 1, taps - 1)), weight, groups=channels)
+    batch, _, length = phased.shape
+    upsampled = ratio * phased.view(batch, channels, ratio, length).transpose(2, 3).reshape(batch, channels, -1)
+    return upsampled[..., self.pad_left : -self.pad_right]
+
+
+def _polyphase_upsample1d_supported(module: nn.Module) -> bool:
+    try:
+        ratio = int(module.ratio)
+        kernel = module.filter
+        return (
+            int(module.stride) == ratio >= 1
+            and kernel.ndim == 3
+            and tuple(kernel.shape[:2]) == (1, 1)
+            and kernel.shape[-1] % ratio == 0
+            and int(module.pad) >= 0
+            and int(module.pad_left) > 0
+            and int(module.pad_right) > 0
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _install_deterministic_audio_upsample(remote: nn.Module) -> int:
+    """Bind the polyphase forward to every supported remote ``UpSample1d``.
+
+    Each module is checked against its own forward on a small input first; a
+    module whose contract or result differs keeps the remote implementation.
+    Returns the number of modules switched.
+    """
+    installed = 0
+    for name, module in remote.named_modules():
+        if type(module).__name__ != "UpSample1d" or not _polyphase_upsample1d_supported(module):
+            continue
+        # Self-check on a CPU float64 copy of the module's attributes.
+        try:
+            twin = types.SimpleNamespace(
+                **{attr: getattr(module, attr) for attr in ("ratio", "stride", "pad", "pad_left", "pad_right")},
+                filter=module.filter.detach().to(device="cpu", dtype=torch.float64),
+            )
+            probe = torch.linspace(-1.0, 1.0, 3 * 37, dtype=torch.float64, device="cpu").sin().view(1, 3, 37)
+            with torch.no_grad():
+                expected = type(module).forward(twin, probe)
+                actual = _polyphase_upsample1d_forward(twin, probe)
+            matches = actual.shape == expected.shape and torch.allclose(actual, expected, rtol=1e-10, atol=1e-12)
+        except Exception as exc:  # noqa: BLE001 - any failure keeps the remote implementation
+            logger.warning("MiniMax H3 audio VAE keeps the remote UpSample1d for %s: %r", name, exc)
+            continue
+        if not matches:
+            logger.warning("MiniMax H3 audio VAE keeps the remote UpSample1d for %s: polyphase self-check failed", name)
+            continue
+        module.__dict__.pop("_h3_polyphase_weights", None)
+        module.forward = _polyphase_upsample1d_forward.__get__(module)
+        installed += 1
+    return installed
+
+
+@contextmanager
+def _deterministic_audio_decode_context(device: torch.device) -> Iterator[None]:
+    """Hold the waveform decode to deterministic cuDNN algorithms (CUDA only)."""
+    if device.type != "cuda" or not current_omni_platform.is_cuda():
+        yield
+        return
+    cudnn = torch.backends.cudnn
+    previous = cudnn.deterministic
+    cudnn.deterministic = True
+    try:
+        yield
+    finally:
+        cudnn.deterministic = previous
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -1514,6 +1635,10 @@ class MiniMaxH3AudioVAE(nn.Module):
             )
         self.model = self.remote.model
         self.sample_rate = int(self.config_dict["sample_rate"])
+        self.deterministic_decode = not self.encode_only and _deterministic_audio_enabled()
+        if self.deterministic_decode:
+            installed = _install_deterministic_audio_upsample(self.remote)
+            logger.info("MiniMax H3 audio VAE: deterministic decode, %d polyphase UpSample1d", installed)
 
     def load_to_device(self) -> None:
         if self._stager is not None:
@@ -1607,8 +1732,13 @@ class MiniMaxH3AudioVAE(nn.Module):
         ).view(1, channels, 1)
         # The remote decoder's TorchScript activations round differently on
         # their first (unfused) call; keep every request on the same path.
+        deterministic = (
+            _deterministic_audio_decode_context(latent.device)
+            if getattr(self, "deterministic_decode", False)
+            else nullcontext()
+        )
         with h3_range("h3.vae_audio.decode"):
-            with torch.jit.optimized_execution(False):
+            with torch.jit.optimized_execution(False), deterministic:
                 waveform = self.remote.decode(latent * std + mean)
         if waveform.ndim != 3 or waveform.shape[1] != 1:
             raise ValueError(f"unexpected decoded audio shape {tuple(waveform.shape)}")
