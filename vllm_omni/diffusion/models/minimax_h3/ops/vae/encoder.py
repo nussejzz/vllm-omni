@@ -193,7 +193,9 @@ def _norm_time_isolated(norm: nn.Module) -> bool | None:
         return None
     time_isolated = name == "TemporalIsolatedSpatialParallelGroupNorm"
     channels = norm.num_channels
-    probe = torch.randn(1, channels, 2, 2, 3, generator=torch.Generator().manual_seed(0))
+    # The CPU generator needs a CPU tensor: model loaders build the pipeline
+    # under a default-device context, which would otherwise place it on CUDA.
+    probe = torch.randn(1, channels, 2, 2, 3, generator=torch.Generator().manual_seed(0), device="cpu")
     probe = probe.to(device=norm.weight.device, dtype=norm.weight.dtype)
     with torch.no_grad():
         try:

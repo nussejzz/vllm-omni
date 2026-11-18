@@ -149,6 +149,17 @@ def test_fused_encoder_peak_memory_stays_below_checkpoint():
     assert peak(fused) <= peak(reference)
 
 
+def test_encoder_fusion_installs_under_a_default_device_context():
+    # The diffusion model loader constructs the pipeline (and so the video VAE)
+    # inside ``with torch.device(<accelerator>)``; the install probes must not
+    # depend on the default device.
+    device, pad_op = _pad_operator()
+    encoder = make_encoder().to(device)
+    with torch.device(device):
+        assert install_h3_vae_encoder_fusion(encoder, device=device)
+    assert encoder.conv_in._omni_causal_reflect_pad is pad_op
+
+
 @pytest.mark.parametrize("time_isolated", [True, False])
 def test_fused_encoder_matches_checkpoint_forward(time_isolated):
     device, pad_op = _pad_operator()
