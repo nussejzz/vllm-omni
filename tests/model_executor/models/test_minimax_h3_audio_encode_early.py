@@ -5,6 +5,7 @@
 import hashlib
 import shutil
 import subprocess
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -28,12 +29,14 @@ class FakeAudioVAE:
     def __init__(self, *, fail: int = 0, events: list[str] | None = None) -> None:
         self.calls: list[tuple[torch.Tensor, int]] = []
         self.threads: list[int] = []
+        self.idents: list[int] = []
         self.fail = fail
         self.events = events
 
     def encode_waveform(self, waveform: torch.Tensor, sample_rate: int) -> tuple[torch.Tensor, int]:
         self.calls.append((waveform, sample_rate))
         self.threads.append(torch.get_num_threads())
+        self.idents.append(threading.get_ident())
         if self.events is not None:
             self.events.append("encode")
         if self.fail:
@@ -183,25 +186,6 @@ def test_encode_media_encodes_what_the_early_rows_miss():
     _assert_same_conditioning(early, serial)
 
 
-@pytest.mark.parametrize("sample_rate", [16000, 22050, 44100, 48000])
-def test_wvae_cpu_resample_does_not_depend_on_the_intra_op_thread_count(sample_rate):
-    # The early encode resamples on one thread, the codec phase on the full pool.
-    import torchaudio
-
-    from vllm_omni.diffusion.models.minimax_h3.vae import MINIMAX_H3_AUDIO_SAMPLE_RATE
-
-    waveform = torch.randn(2, int(5.17 * sample_rate), generator=torch.Generator().manual_seed(sample_rate))
-    threads = torch.get_num_threads()
-    try:
-        outputs = []
-        for count in (1, max(2, threads)):
-            torch.set_num_threads(count)
-            outputs.append(torchaudio.transforms.Resample(sample_rate, MINIMAX_H3_AUDIO_SAMPLE_RATE)(waveform))
-    finally:
-        torch.set_num_threads(threads)
-    assert torch.equal(outputs[0], outputs[1])
-
-
 @pytest.fixture(scope="module")
 def sources(tmp_path_factory):
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
@@ -277,13 +261,16 @@ def test_prepare_encodes_reference_audio_while_the_frames_decode(monkeypatch, so
     vae = FakeAudioVAE(events=events)
     encodings = processing.ReferenceAudioEncodings(vae)
     threads = torch.get_num_threads()
+    set_threads = []
+    monkeypatch.setattr(processing.torch, "set_num_threads", set_threads.append)
     prepared = _prepare(sources, reference_audio=encodings)
     # Both references are encoded before this thread first waits for frames,
-    # on one intra-op thread, and the thread count is restored afterwards.
+    # on this thread (the WVAE's determinism flags are process-global) and at
+    # its own intra-op thread count, as the codec phase would encode them.
     assert events == ["encode", "encode", "frames"]
     assert len(encodings) == 2
-    assert vae.threads == [1, 1]
-    assert torch.get_num_threads() == threads
+    assert vae.idents == [threading.get_ident()] * 2
+    assert vae.threads == [threads, threads] and set_threads == []
     serial = _prepare(sources)
     assert _digest(prepared) == _digest(serial)
     early = _encode(prepared, vae, reference_audio=encodings)

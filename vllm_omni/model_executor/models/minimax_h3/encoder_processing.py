@@ -756,10 +756,8 @@ def _encode_reference_audio_early(
 
     Each waveform is the tensor, or the view, :func:`encode_media` reads. A
     failure is left to the codec phase, which encodes that waveform again and
-    raises where the serial path does. The WVAE's CPU resample runs on one
-    intra-op thread: a full pool keeps spinning after each parallel region and
-    takes the cores the ffmpeg frame jobs decode on, slowing both. One thread
-    resamples a 15 s reference in milliseconds, with the same result.
+    raises where the serial path does. The WVAE's CPU resample keeps this
+    thread's intra-op thread count, the one the codec phase would use.
     """
 
     def inputs() -> Iterable[tuple[torch.Tensor, int]]:
@@ -771,14 +769,10 @@ def _encode_reference_audio_early(
                 waveform, sample_rate = future.result()
                 yield waveform.float().contiguous(), int(sample_rate)
 
-    threads = torch.get_num_threads()
-    torch.set_num_threads(1)
     try:
         reference_audio.encode(inputs())
     except Exception:
         logger.debug("MiniMax H3 early reference-audio encode failed; the codec phase encodes it", exc_info=True)
-    finally:
-        torch.set_num_threads(threads)
 
 
 def _effective_audio_inputs(
