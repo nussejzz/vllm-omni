@@ -20,6 +20,10 @@ rotated and written — together with their V rows — straight into the joint
 ``[B, S_0 + S_1, H, D]`` Q/K/V that attention consumes, replacing the block's
 four norms, three ``cat`` copies and two RoPE passes with one launch.
 
+``fused_qk_norm_rope_head_groups`` stores the half-split result head-group-major
+(``[groups, tokens, heads / groups, head_dim]``, the strict Ulysses all-to-all
+send layout) so sequence-parallel callers skip the Q/K permute copies.
+
 The CUDA fast path fuses RMSNorm and RoPE without materializing normalized Q/K
 or rotary-product intermediates. The interleaved mode supports any even
 ``rotary_dim <= head_dim <= 256`` (``tl.arange`` padding to the next power of
@@ -130,12 +134,16 @@ if HAS_TRITON:
         out_stride_t,
         out_stride_h,
         out_stride_d,
+        out_stride_group,
         num_heads: tl.constexpr,
         head_dim: tl.constexpr,
         rotary_half: tl.constexpr,
         eps: tl.constexpr,
         heads_per_program: tl.constexpr,
+        out_group_heads: tl.constexpr,
     ):
+        # out_group_heads > 0 stores head h at group h // out_group_heads (stride
+        # out_stride_group), slot h % out_group_heads; only the store address changes.
         # Long-video Q/K views can span more than 2**31 elements of fused QKV storage.
         token = tl.program_id(0).to(tl.int64)
         head_group = tl.program_id(1)
@@ -176,7 +184,15 @@ if HAS_TRITON:
             normalized.to(tl.float32),
         )
 
-        out_offsets = token * out_stride_t + heads[:, None] * out_stride_h + dims[None, :] * out_stride_d
+        if out_group_heads > 0:
+            out_offsets = (
+                token * out_stride_t
+                + (heads[:, None] // out_group_heads).to(tl.int64) * out_stride_group
+                + (heads[:, None] % out_group_heads) * out_stride_h
+                + dims[None, :] * out_stride_d
+            )
+        else:
+            out_offsets = token * out_stride_t + heads[:, None] * out_stride_h + dims[None, :] * out_stride_d
         tl.store(out_ptr + out_offsets, output, mask=mask)
 
     @triton.jit
@@ -673,10 +689,19 @@ def _launch_fused_rms_norm_rope(
     weight: torch.Tensor,
     rope_table: torch.Tensor,
     eps: float,
+    head_groups: int = 0,
 ) -> torch.Tensor:
+    """Launch the half-split kernel; ``head_groups > 0`` stores ``[groups, tokens, heads // groups, head_dim]``."""
     tokens, heads, head_dim = x.shape
     rotary_half = rope_table.shape[-1] // 2
-    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    if head_groups:
+        out = torch.empty((head_groups, tokens, heads // head_groups, head_dim), dtype=x.dtype, device=x.device)
+        out_stride_group, out_stride_t, out_stride_h, out_stride_d = out.stride()
+        out_group_heads = heads // head_groups
+    else:
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        out_stride_t, out_stride_h, out_stride_d = out.stride()
+        out_stride_group = out_group_heads = 0
     if tokens == 0:
         return out
     grid = (tokens, triton.cdiv(heads, _HEADS_PER_PROGRAM))
@@ -689,14 +714,16 @@ def _launch_fused_rms_norm_rope(
         x.stride(1),
         x.stride(2),
         rope_table.stride(0),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
+        out_stride_t,
+        out_stride_h,
+        out_stride_d,
+        out_stride_group,
         num_heads=heads,
         head_dim=head_dim,
         rotary_half=rotary_half,
         eps=eps,
         heads_per_program=_HEADS_PER_PROGRAM,
+        out_group_heads=out_group_heads,
         num_warps=8,
     )
     return out
@@ -1254,6 +1281,47 @@ def fused_qk_norm_rope(
     )
 
 
+def fused_qk_norm_rope_head_groups(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    rope_table: torch.Tensor,
+    eps: float,
+    head_groups: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Half-split ``fused_qk_norm_rope`` that writes each output head-group-major.
+
+    Returns Q and K as ``[head_groups, tokens, heads // head_groups, head_dim]``:
+    group ``g`` holds heads ``[g * heads // head_groups, (g + 1) * heads // head_groups)``
+    for every token, which is the strict Ulysses all-to-all send layout. The
+    values are those of ``fused_qk_norm_rope`` (same half-split kernel, only the
+    store address differs). Returns ``None`` where that CUDA kernel does not run
+    (other devices, dtypes or geometries); callers keep ``fused_qk_norm_rope``.
+    """
+    if q.ndim != 3 or k.shape != q.shape:
+        raise ValueError(f"q and k must be matching [tokens, heads, head_dim], got {q.shape} and {k.shape}")
+    if head_groups <= 0 or q.shape[1] % head_groups:
+        raise ValueError(f"head_groups must divide the {q.shape[1]} heads, got {head_groups}")
+    head_dim = q.shape[-1]
+    rotary_dim = rope_table.shape[-1]
+    if not _fused_cuda_supported(q, k, head_dim, rotary_dim, interleaved=False):
+        return None
+    if q_weight.shape != (head_dim,) or k_weight.shape != (head_dim,):
+        raise ValueError(f"Expected norm weights [{head_dim}], got {tuple(q_weight.shape)} and {tuple(k_weight.shape)}")
+    if q_weight.device != q.device or k_weight.device != q.device:
+        raise ValueError("Q/K norm weights must be on the activation device")
+    if rope_table.device != q.device or rope_table.dtype not in (q.dtype, torch.float32):
+        raise ValueError("rope_table must be on q/k's device with their dtype or float32")
+    if rope_table.shape != (q.shape[0], rotary_dim):
+        raise ValueError(f"Expected rope_table [{q.shape[0]}, {rotary_dim}], got {tuple(rope_table.shape)}")
+    rope_table = rope_table.contiguous()
+    return (
+        _launch_fused_rms_norm_rope(q, q_weight.contiguous(), rope_table, eps, head_groups),
+        _launch_fused_rms_norm_rope(k, k_weight.contiguous(), rope_table, eps, head_groups),
+    )
+
+
 # ``joint_attention_kwargs`` key under which a model forward hands the packed
 # table of the current forward to its attention sites.
 QK_NORM_ROPE_TABLE_KEY = "qk_norm_rope_table"
@@ -1263,6 +1331,7 @@ __all__ = [
     "fused_joint_qkv_norm_rope",
     "fused_qk_norm_rope",
     "fused_qk_norm_rope_available",
+    "fused_qk_norm_rope_head_groups",
     "fused_qk_norm_rope_min_tokens",
     "pack_qk_norm_rope_table",
 ]

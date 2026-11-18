@@ -282,6 +282,9 @@ _MODEL_INTERNALIZE = (
     # MiniMax-H3: transitional rollback/A-B switch for the cross-clip VAE tile
     # schedule (0 = one tile schedule and gather per temporal clip).
     "VLLM_OMNI_H3_VAE_GLOBAL_TILES",
+    # MiniMax-H3: transitional rollback/A-B switch for the strict-Ulysses Q/K/O
+    # permute trim (0 = permute copies before every all-to-all).
+    "VLLM_OMNI_H3_ULYSSES_PERMUTE_TRIM",
     # CI-only fallback for memory-constrained MOSS Realtime qualification.
     "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE",
     "VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR",

@@ -31,6 +31,11 @@ logger = init_logger(__name__)
 _UAA_PAD_RATIO_WARN_THRESHOLD = 1.5
 _uaa_pad_ratio_warned: set[tuple[int, int, int, str]] = set()
 
+# ``AttentionMetadata.extra`` key: a truthy value asks the strict NCCL reverse
+# all-to-all to send a batch-1 attention output token-major as it is, instead
+# of permuting it head-major first (same bytes, one copy fewer).
+ULYSSES_TOKEN_MAJOR_OUTPUT_KEY = "ulysses_token_major_output"
+
 
 def _maybe_warn_uaa_pad_ratio(
     query_head_cnt: int,
@@ -78,6 +83,11 @@ def _a2a_permute_enabled(enabled: bool, scatter_idx: int, gather_idx: int, world
 
 def _ceil_div(n: int, d: int) -> int:
     return (n + d - 1) // d
+
+
+def _merge_split_heads(t: torch.Tensor) -> torch.Tensor:
+    """Return a head-split ``[B, S, P, H/P, D]`` Q/K/V as ``[B, S, H, D]`` (a copy); pass 4D through."""
+    return t.flatten(2, 3) if t.dim() == 5 else t
 
 
 def _positive_divisors(n: int) -> list[int]:
@@ -224,6 +234,8 @@ class _UlyssesCtx(ParallelAttentionContext):
     uaa_local_seq_len: int = 0
     orig_head_cnt: int = 0
     joint_orig_head_cnt: int = 0
+    # Strict NCCL only: send the batch-1 output token-major (ULYSSES_TOKEN_MAJOR_OUTPUT_KEY).
+    token_major_output: bool = False
 
 
 class UlyssesParallelAttention:
@@ -275,6 +287,19 @@ class UlyssesParallelAttention:
     def name(self) -> str:
         return "ulysses"
 
+    def split_heads_send_degree(self) -> int:
+        """Ulysses degree P if Q/K/V may arrive head-split, else 0.
+
+        Only the strict NCCL all-to-all consumes ``[B, S/P, P, H/P, D]``
+        inputs as they are: a producer that wrote their ``[P, S/P, B, H/P, D]``
+        send layout directly skips that tensor's permute copy. Every other
+        transport merges them back to ``[B, S/P, H, D]`` first.
+        """
+        world_size = self._sp_group.ulysses_world_size
+        if world_size <= 1 or (self._scatter_idx, self._gather_idx) != (2, 1) or self._ulysses_a2a_permute:
+            return 0
+        return world_size if get_ulysses_mode(default="strict") == "strict" else 0
+
     def pre_attention(
         self,
         query: torch.Tensor,
@@ -299,6 +324,12 @@ class UlyssesParallelAttention:
 
             validate_a2a_permute_config(ulysses_mode=mode)
         ulysses_world_size = self._sp_group.ulysses_world_size
+        if any(t.dim() == 5 for t in (query, key, value)):
+            # Head-split inputs (see split_heads_send_degree) stay split only on
+            # the strict NCCL path without a VSA gate (whose shape is plain Q's).
+            has_gate = attn_metadata is not None and isinstance(attn_metadata.extra.get("gate_compress"), torch.Tensor)
+            if has_gate or self.split_heads_send_degree() == 0:
+                query, key, value = (_merge_split_heads(t) for t in (query, key, value))
         gate_compress = None
         if attn_metadata is not None:
             candidate = attn_metadata.extra.get("gate_compress")
@@ -617,6 +648,11 @@ class UlyssesParallelAttention:
             uaa_local_seq_len=local_seq_len if mode == "advanced_uaa" else 0,
             orig_head_cnt=int(orig_head_cnt) if mode == "advanced_uaa" else 0,
             joint_orig_head_cnt=int(joint_orig_head_cnt) if mode == "advanced_uaa" else 0,
+            token_major_output=(
+                mode != "advanced_uaa"
+                and attn_metadata is not None
+                and bool(attn_metadata.extra.get(ULYSSES_TOKEN_MAJOR_OUTPUT_KEY))
+            ),
         )
         use_2d_mask = False
         if attn_metadata is not None:
@@ -748,4 +784,6 @@ class UlyssesParallelAttention:
             if ctx.use_sync:
                 current_omni_platform.synchronize()
             return output
+        if ctx.token_major_output:
+            return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync, True)
         return SeqAllToAll4D.apply(ctx.ulysses_pg, attn_output, ctx.gather_idx, ctx.scatter_idx, ctx.use_sync)

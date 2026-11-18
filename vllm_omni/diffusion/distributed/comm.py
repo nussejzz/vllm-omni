@@ -21,22 +21,32 @@ def all_to_all_4D(
     group=None,
     use_sync: bool = False,
     *,
+    token_major_send: bool = False,
     _output_destination: torch.Tensor | None = None,
 ) -> torch.tensor:
     """
     all-to-all for QKV
 
     Args:
-        input (torch.tensor): a tensor sharded along dim scatter dim
+        input (torch.tensor): a tensor sharded along dim scatter dim. With
+            scatter_idx=2 it may also arrive head-split per destination rank as
+            (bs, seqlen/P, P, hc/P, hs); a producer that wrote that view's
+            (P, seqlen/P, bs, hc/P, hs) send layout skips the permute copy.
         scatter_idx (int): default 1
         gather_idx (int): default 2
         group (torch.distributed.ProcessGroup): torch process group
         use_sync (bool): whether to synchronize after all-to-all
+        token_major_send (bool): for scatter_idx=1 with bs == 1, send each
+            rank's contiguous row slice as it is and permute once on receipt
+            instead of permuting the send buffer to head-major first (same
+            bytes, one copy fewer). Ignored otherwise.
 
     Returns:
         torch.tensor: resharded tensor (bs, seqlen/P, hc, hs)
     """
-    assert input.dim() == 4, f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
+    assert input.dim() == 4 or (input.dim() == 5 and (scatter_idx, gather_idx) == (2, 1)), (
+        f"input must be 4D tensor, got {input.dim()} and shape {input.shape}"
+    )
 
     seq_world_size = dist.get_world_size(group)
     if _output_destination is not None:
@@ -57,12 +67,19 @@ def all_to_all_4D(
 
     if scatter_idx == 2 and gather_idx == 1:
         # input (torch.tensor): a tensor sharded along dim 1 (bs, seqlen/P, hc, hs) output: (bs, seqlen, hc/P, hs)
-        bs, shard_seqlen, hc, hs = input.shape
+        if input.dim() == 5:
+            # Heads already split per destination rank: (bs, seqlen/P, P, hc/P, hs).
+            bs, shard_seqlen, split_ranks, shard_hc, hs = input.shape
+            if split_ranks != seq_world_size:
+                raise ValueError(f"head-split input has {split_ranks} rank groups for world size {seq_world_size}")
+        else:
+            bs, shard_seqlen, hc, hs = input.shape
+            shard_hc = hc // seq_world_size
         seqlen = shard_seqlen * seq_world_size
-        shard_hc = hc // seq_world_size
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen/P, hc, hs) -reshape-> (bs, seq_len/P, P, hc/P, hs) -transpose(0,2)-> (P, seq_len/P, bs, hc/P, hs)
+        # A head-split input written in the send layout is already contiguous here (no copy).
         input_t = input.reshape(bs, shard_seqlen, seq_world_size, shard_hc, hs).transpose(0, 2).contiguous()
 
         output = torch.empty_like(input_t)
@@ -89,6 +106,20 @@ def all_to_all_4D(
         hc = shard_hc * seq_world_size
         shard_seqlen = seqlen // seq_world_size
         seq_world_size = dist.get_world_size(group)
+
+        if token_major_send and bs == 1:
+            # With one batch row, the rows bound for rank r are already the
+            # contiguous slice r: (1, seqlen, hc/P, hs) -view-> (P, seqlen/P, hc/P, hs).
+            input_t = input.reshape(seq_world_size, shard_seqlen, shard_hc, hs).contiguous()
+            output = torch.empty_like(input_t)
+            if seq_world_size > 1:
+                dist.all_to_all_single(output, input_t, group=group)
+                if use_sync:
+                    current_omni_platform.synchronize()
+            else:
+                output = input_t
+            # (P, seqlen/P, hc/P, hs) -transpose(0,1)-> (seqlen/P, P, hc/P, hs) = (bs, seqlen/P, hc, hs)
+            return output.transpose(0, 1).contiguous().reshape(bs, shard_seqlen, hc, hs)
 
         # transpose groups of heads with the seq-len parallel dimension, so that we can scatter them!
         # (bs, seqlen, hc/P, hs) -reshape-> (bs, P, seq_len/P, hc/P, hs) -transpose(0, 3)->
@@ -160,12 +191,15 @@ class SeqAllToAll4D(torch.autograd.Function):
         scatter_idx: int,
         gather_idx: int,
         use_sync: bool = False,
+        token_major_send: bool = False,
     ) -> Tensor:
         ctx.group = group
         ctx.scatter_idx = scatter_idx
         ctx.gather_idx = gather_idx
         ctx.use_sync = use_sync
-        return all_to_all_4D(input, scatter_idx, gather_idx, group=group, use_sync=use_sync)
+        return all_to_all_4D(
+            input, scatter_idx, gather_idx, group=group, use_sync=use_sync, token_major_send=token_major_send
+        )
 
 
 def all_to_all_5D(

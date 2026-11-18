@@ -554,3 +554,34 @@ def test_fused_joint_qkv_norm_rope_large_storage_offsets(large_stream):
     for value in actual:
         assert value.shape == (1, 5, 1, 128)
         torch.testing.assert_close(value, torch.ones_like(value), atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or not HAS_TRITON, reason="CUDA and Triton required")
+@pytest.mark.parametrize("seq_len", [1, 333])
+@pytest.mark.parametrize("head_groups", [1, 2, 7, 8])
+def test_head_groups_store_the_half_split_result_in_send_layout(seq_len, head_groups):
+    """Head-group-major stores are the strict Ulysses send permute of the plain output, bit for bit."""
+    from vllm_omni.diffusion.layers.fused_qk_norm_rope import (
+        fused_qk_norm_rope,
+        fused_qk_norm_rope_head_groups,
+    )
+
+    torch.manual_seed(23)
+    # MiniMax-H3 geometry: eight-head program tiles straddle 7-head groups.
+    heads = 56
+    qkv = torch.randn(seq_len, 3 * heads * _HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    q = qkv[:, : heads * _HEAD_DIM].view(seq_len, heads, _HEAD_DIM)
+    k = qkv[:, heads * _HEAD_DIM : 2 * heads * _HEAD_DIM].view(seq_len, heads, _HEAD_DIM)
+    q_weight = torch.randn(_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k_weight = torch.randn(_HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    freqs = torch.randn(seq_len, _ROTARY_DIM // 2, device="cuda")
+    rope_table = torch.cat((torch.cos(freqs), torch.sin(freqs)), dim=-1).to(torch.bfloat16)
+
+    plain = fused_qk_norm_rope(q, k, q_weight, k_weight, rope_table, _EPS)
+    grouped = fused_qk_norm_rope_head_groups(q, k, q_weight, k_weight, rope_table, _EPS, head_groups)
+    assert grouped is not None
+    for expected, actual in zip(plain, grouped):
+        assert actual.shape == (head_groups, seq_len, heads // head_groups, _HEAD_DIM)
+        assert actual.is_contiguous()
+        send = expected.view(seq_len, head_groups, heads // head_groups, _HEAD_DIM).transpose(0, 1)
+        assert torch.equal(actual, send)

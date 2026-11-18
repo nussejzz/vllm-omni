@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -27,9 +28,10 @@ from vllm_omni.diffusion.attention.backends.abstract import (
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
 from vllm_omni.diffusion.attention.backends.vdnh3_attn import VDNLayout
 from vllm_omni.diffusion.attention.layer import Attention, ScheduleCandidate
+from vllm_omni.diffusion.attention.parallel.ulysses import ULYSSES_TOKEN_MAJOR_OUTPUT_KEY, UlyssesParallelAttention
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.layers.activation import SiluAndMul
-from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope
+from vllm_omni.diffusion.layers.fused_qk_norm_rope import fused_qk_norm_rope, fused_qk_norm_rope_head_groups
 from vllm_omni.diffusion.layers.indexed_modulation import (
     indexed_gate,
     indexed_gate_rms_norm_scale_shift,
@@ -67,6 +69,24 @@ MINIMAX_H3_ADALN_MODALITY_NUM = 3
 MINIMAX_H3_LASER_INPUT_SCALE = 256.0
 
 
+# Transitional switch for the strict-Ulysses permute trim: unset or 1 lets the
+# fused Q/K norm+RoPE kernel write the all-to-all send layout and sends the
+# attention output token-major, skipping the Q, K and O permute copies of every
+# block (pure layout, bit-identical output); 0 restores those copies.
+MINIMAX_H3_ULYSSES_PERMUTE_TRIM_ENV = "VLLM_OMNI_H3_ULYSSES_PERMUTE_TRIM"
+
+
+def _ulysses_permute_trim_enabled() -> bool:
+    raw = os.environ.get(MINIMAX_H3_ULYSSES_PERMUTE_TRIM_ENV, "").strip()
+    if raw not in ("", "0", "1"):
+        raise ValueError(f"{MINIMAX_H3_ULYSSES_PERMUTE_TRIM_ENV} must be 0 or 1, got {raw!r}")
+    return raw != "0"
+
+
+# Read once at import, which also rejects an invalid value up front.
+_ULYSSES_PERMUTE_TRIM = _ulysses_permute_trim_enabled()
+
+
 # Packed multi-request forwards require the attention backend to actually
 # consume cu_seqlens as a block-diagonal plan (not a padding-mask rebuild that
 # spans the full packed row). The pipeline gates on this capability before
@@ -80,6 +100,22 @@ def _ring_sequence_parallel_is_active(attention_layer: Attention) -> bool:
     if is_forward_context_available() and not get_forward_context().sp_active:
         return False
     return True
+
+
+def _ulysses_send_head_groups(attention_layer: Attention, num_heads: int) -> int:
+    """Ulysses degree when this forward's Q/K may be produced in the strict all-to-all send layout, else 0.
+
+    Pure strict Ulysses over NCCL only (no Ring, AllGather-KV or copy-engine
+    transport); anything else keeps the plain ``[T, H, D]`` Q/K.
+    """
+    if _ring_sequence_parallel_is_active(attention_layer):
+        return 0
+    get_strategy = getattr(attention_layer, "_get_active_parallel_strategy", None)
+    strategy = get_strategy() if callable(get_strategy) else None
+    if type(strategy) is not UlyssesParallelAttention:
+        return 0
+    degree = strategy.split_heads_send_degree()
+    return degree if degree and num_heads % degree == 0 else 0
 
 
 def _attention_isolates_packed_requests(attention_layer: Any, backend: type[AttentionBackend] | None = None) -> bool:
@@ -355,6 +391,7 @@ class MiniMaxH3Attention(nn.Module):
         reference_kv_layer_index: int | None = None,
         reference_kv_compact: bool = False,
         vdn_window: VDNLayout | None = None,
+        ulysses_token_major_output: bool = False,
     ) -> torch.Tensor:
         """Run packed attention as a small eager island.
 
@@ -362,6 +399,10 @@ class MiniMaxH3Attention(nn.Module):
         reference K/V after Ulysses has exchanged sequence rows for head shards,
         then prepends the balanced cached head shard as a K/V-only prefix. This
         avoids both rebuilding reference QKV and redistributing cached K/V.
+
+        Q/K may arrive head-split as ``[T, P, H/P, D]`` views of the strict
+        Ulysses send buffers; ``ulysses_token_major_output`` has the output
+        all-to-all send the attention rows without a permute copy.
         """
         if not 0 < max_seqlen <= packed_total:
             raise ValueError(
@@ -440,6 +481,8 @@ class MiniMaxH3Attention(nn.Module):
                 extra["vsa_h3_prefix_segments"] = vsa_prefix_segments
         if vdn_window is not None:
             extra["vdn_window"] = vdn_window
+        if ulysses_token_major_output:
+            extra[ULYSSES_TOKEN_MAJOR_OUTPUT_KEY] = True
         if reference_kv_compact:
             extra["minimax_h3_compact_reference_rows"] = reference_rows
         if reference_kv_state is not None:
@@ -476,9 +519,18 @@ class MiniMaxH3Attention(nn.Module):
         ).squeeze(0)
 
     def _project_qkv(
-        self, x: torch.Tensor, rope_table: torch.Tensor | None, vdn_window: VDNLayout | None = None
+        self,
+        x: torch.Tensor,
+        rope_table: torch.Tensor | None,
+        vdn_window: VDNLayout | None = None,
+        send_head_groups: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Project/normalize/rotate QKV, retaining raw Q/K for the VDN branch."""
+        """Project/normalize/rotate QKV, retaining raw Q/K for the VDN branch.
+
+        ``send_head_groups`` (the strict Ulysses degree P) lets the fused
+        kernel write normalized Q/K straight into the ``[P, T, H/P, D]``
+        all-to-all send layout; they are returned as ``[T, P, H/P, D]`` views.
+        """
         total = x.shape[0]
         qkv, _ = self.qkv_proj(x)
         q_size = self.num_heads * self.head_dim
@@ -491,7 +543,20 @@ class MiniMaxH3Attention(nn.Module):
             raise ValueError(f"{self._prefix} is VDN-H3 hybrid attention but received no VDN window")
         # The VDN linear branch reads the raw projections; norm/RoPE are out of place.
         q_raw, k_raw = q, k
-        if rope_table is None:
+        send_qk = None
+        if rope_table is not None and send_head_groups:
+            send_qk = fused_qk_norm_rope_head_groups(
+                q,
+                k,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                rope_table,
+                self.q_norm.variance_epsilon,
+                send_head_groups,
+            )
+        if send_qk is not None:
+            q, k = (t.permute(1, 0, 2, 3) for t in send_qk)
+        elif rope_table is None:
             q = self.q_norm(q)
             k = self.k_norm(k)
         else:
@@ -542,7 +607,19 @@ class MiniMaxH3Attention(nn.Module):
                 reference_kv_state.local_sequence_rows,
                 projected_rows=total,
             )
-        q, k, v, q_raw, k_raw = self._project_qkv(x, rope_table, vdn_window)
+        # Strict Ulysses permute trim, on the eager plain dense path only (no
+        # VSA gate, no VDN branch).
+        send_head_groups = 0
+        if (
+            _ULYSSES_PERMUTE_TRIM
+            and rope_table is not None
+            and x.is_cuda
+            and self.to_gate_compress is None
+            and self.vdn is None
+            and not torch.compiler.is_compiling()
+        ):
+            send_head_groups = _ulysses_send_head_groups(self.attention, self.num_heads)
+        q, k, v, q_raw, k_raw = self._project_qkv(x, rope_table, vdn_window, send_head_groups)
 
         # The gate is projected from the same local rows as Q. Pure Ulysses
         # reshards it alongside Q/K/V in UlyssesParallelAttention so each VSA
@@ -574,6 +651,7 @@ class MiniMaxH3Attention(nn.Module):
             reference_kv_layer_index=reference_kv_layer_index,
             reference_kv_compact=reference_kv_compact,
             vdn_window=vdn_window,
+            ulysses_token_major_output=send_head_groups > 0,
         )
         if self.vdn is not None:
             out = self.vdn.gate_softmax(out, x)
