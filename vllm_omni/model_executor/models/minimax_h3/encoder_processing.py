@@ -9,9 +9,9 @@ import math
 import os
 import subprocess
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,6 +62,24 @@ logger = init_logger(__name__)
 MINIMAX_H3_FPS = 24
 MINIMAX_H3_MIN_OUTPUT_SECONDS = 4.0
 MINIMAX_H3_MAX_OUTPUT_SECONDS = 15.0
+MINIMAX_H3_AUDIO_ENCODE_EARLY_ENV = "VLLM_OMNI_H3_AUDIO_ENCODE_EARLY"
+
+
+def audio_encode_early() -> bool:
+    """Whether rank 0 encodes Ref2VA reference audio while the reference frames decode.
+
+    Unset or ``1`` encodes it then (see :class:`ReferenceAudioEncodings`);
+    ``0`` keeps the audio WVAE after the video VAE in :func:`encode_media`.
+    """
+    raw = os.environ.get(MINIMAX_H3_AUDIO_ENCODE_EARLY_ENV, "").strip()
+    if raw not in ("", "0", "1"):
+        raise ValueError(f"{MINIMAX_H3_AUDIO_ENCODE_EARLY_ENV} must be 0 or 1, got {raw!r}")
+    return raw != "0"
+
+
+# Reject an invalid switch value when the model is imported rather than on
+# every request; requests still read it, so it can change between them.
+audio_encode_early()
 
 
 def _items(value: Any) -> list[Any]:
@@ -190,6 +208,11 @@ class _ReferenceAudioPrefetch:
             raise fetched.probe_error
         assert fetched.meta is not None
         return fetched.meta
+
+    def decoded(self) -> list[tuple[torch.Tensor, int]]:
+        """Every waveform the prefetch decoded, waiting for each; consumes nothing."""
+        fetched = [fetch.result() for fetches in self._fetches.values() for fetch in fetches]
+        return [item.audio for item in fetched if item.audio is not None]
 
     def load(self, path: str) -> tuple[torch.Tensor, int]:
         fetched = self._next(path, self._loaded)
@@ -666,6 +689,98 @@ class PreparedEncoderInputs:
     condition_labels: list[tuple[str, int]]
 
 
+class ReferenceAudioEncodings:
+    """Audio WVAE rows rank 0 encodes before :func:`encode_media` asks for them.
+
+    Rank 0 prepares a request alone while the other ranks wait, and the
+    reference frames decode in ffmpeg processes meanwhile. Encoding the
+    reference audio then takes the WVAE out of the codec phase, where the
+    other ranks wait for it at the codec barrier. Encoding runs on the calling
+    thread, so the WVAE's process-global determinism flags still see no other
+    GPU work. :func:`encode_media` takes rows only for a waveform equal in
+    dtype, shape, strides and values to the one encoded and encodes anything
+    else itself, so the conditioning is the serial path's.
+    """
+
+    def __init__(
+        self,
+        audio_vae: Any,
+        *,
+        component_scope: Callable[[Any], AbstractContextManager[Any]] = nullcontext,
+    ) -> None:
+        self._audio_vae = audio_vae
+        self._component_scope = component_scope
+        self._encoded: list[tuple[torch.Tensor, int, tuple[torch.Tensor, int]]] = []
+
+    def __len__(self) -> int:
+        return len(self._encoded)
+
+    def encode(self, inputs: Iterable[tuple[torch.Tensor, int]]) -> None:
+        """Encode each ``(waveform, sample_rate)`` exactly as :func:`encode_media` would.
+
+        The WVAE is staged once, on the first input, so an empty ``inputs`` stages nothing.
+        """
+        with ExitStack() as stack:
+            staged = False
+            for waveform, sample_rate in inputs:
+                if not staged:
+                    stack.enter_context(self._component_scope(self._audio_vae))
+                    staged = True
+                rows, length = self._audio_vae.encode_waveform(waveform, sample_rate)
+                self._encoded.append((waveform, int(sample_rate), (rows, int(length))))
+
+    def take(self, waveform: torch.Tensor, sample_rate: int) -> tuple[torch.Tensor, int] | None:
+        """Remove and return the ``(rows, length)`` encoded for this exact waveform, if any."""
+        for index, (encoded, rate, result) in enumerate(self._encoded):
+            if (
+                rate == int(sample_rate)
+                and encoded.dtype == waveform.dtype
+                and encoded.device == waveform.device
+                and encoded.shape == waveform.shape
+                and encoded.stride() == waveform.stride()
+                and torch.equal(encoded, waveform)
+            ):
+                del self._encoded[index]
+                return result
+        return None
+
+
+def _encode_reference_audio_early(
+    reference_audio: ReferenceAudioEncodings,
+    audio_futures: Sequence[Future[tuple[torch.Tensor, int]] | None],
+    audio_prefetch: _ReferenceAudioPrefetch,
+    *,
+    max_standalone_seconds: float,
+) -> None:
+    """Encode the Ref2VA reference audio on this thread while the reference frames decode.
+
+    Each waveform is the tensor, or the view, :func:`encode_media` reads. A
+    failure is left to the codec phase, which encodes that waveform again and
+    raises where the serial path does. The WVAE's CPU resample runs on one
+    intra-op thread: a full pool keeps spinning after each parallel region and
+    takes the cores the ffmpeg frame jobs decode on, slowing both. One thread
+    resamples a 15 s reference in milliseconds, with the same result.
+    """
+
+    def inputs() -> Iterable[tuple[torch.Tensor, int]]:
+        # Standalone audio first: its prefetch started with the request.
+        standalone = [(waveform.float().contiguous(), int(rate)) for waveform, rate in audio_prefetch.decoded()]
+        yield from _effective_audio_inputs((), standalone, max_standalone_seconds=max_standalone_seconds)
+        for future in audio_futures:
+            if future is not None and future.exception() is None:
+                waveform, sample_rate = future.result()
+                yield waveform.float().contiguous(), int(sample_rate)
+
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        reference_audio.encode(inputs())
+    except Exception:
+        logger.debug("MiniMax H3 early reference-audio encode failed; the codec phase encodes it", exc_info=True)
+    finally:
+        torch.set_num_threads(threads)
+
+
 def _effective_audio_inputs(
     video_audios: Sequence[tuple[torch.Tensor, int] | None],
     standalone_audios: Sequence[tuple[torch.Tensor, int]],
@@ -689,8 +804,13 @@ def prepare_encoder_inputs(
     *,
     task: str | None = None,
     prepared_reference_videos: list[dict[str, Any]] | None = None,
+    reference_audio: ReferenceAudioEncodings | None = None,
 ) -> PreparedEncoderInputs:
-    """Decode references once and prepare the shared text/codec presentation."""
+    """Decode references once and prepare the shared text/codec presentation.
+
+    With ``reference_audio``, Ref2VA reference audio is encoded into it while
+    the reference frames decode (see :class:`ReferenceAudioEncodings`).
+    """
     # 0 keeps the serial path: transcoded reference videos, no prefetch.
     frame_workers = reference_frame_workers()
     audio_prefetch = _ReferenceAudioPrefetch()
@@ -702,6 +822,7 @@ def prepare_encoder_inputs(
             prepared_reference_videos=prepared_reference_videos,
             frame_workers=frame_workers,
             audio_prefetch=audio_prefetch,
+            reference_audio=reference_audio,
         )
     finally:
         audio_prefetch.close()
@@ -715,6 +836,7 @@ def _prepare_encoder_inputs(
     prepared_reference_videos: list[dict[str, Any]] | None,
     frame_workers: int,
     audio_prefetch: _ReferenceAudioPrefetch,
+    reference_audio: ReferenceAudioEncodings | None,
 ) -> PreparedEncoderInputs:
     if isinstance(prompt, str):
         prompt = {"prompt": prompt}
@@ -924,6 +1046,15 @@ def _prepare_encoder_inputs(
                         else None
                         for item in prepared_videos
                     ]
+                    if reference_audio is not None and any(item.get("frames") is not None for item in prepared_videos):
+                        # ffmpeg processes decode the frames while this thread
+                        # would wait for them: encode the reference audio now.
+                        _encode_reference_audio_early(
+                            reference_audio,
+                            audio_futures,
+                            audio_prefetch,
+                            max_standalone_seconds=float(num_frames) / MINIMAX_H3_FPS,
+                        )
                     for item, audio_future in zip(prepared_videos, audio_futures):
                         frame_job = item.get("frames")
                         if frame_job is not None:
@@ -1156,12 +1287,14 @@ def encode_media(
     audio_vae: Any,
     emit_conditioning: bool,
     component_scope: Callable[[Any], AbstractContextManager[Any]] = nullcontext,
+    reference_audio: ReferenceAudioEncodings | None = None,
 ) -> MiniMaxH3EncoderMediaConditioning | None:
     """Run codecs on participating ranks; only the output rank runs audio.
 
     The caller selects participating ranks and configures the VAE process group.
     Every visual participant must call this function with the same references.
     Component scopes allow the diffusion runner to stage one codec at a time.
+    The output rank reuses ``reference_audio`` rows encoded while preparing.
     """
     # Validate before the non-leader return so all participants reject bad input.
     audio_inputs = _effective_audio_inputs(
@@ -1225,9 +1358,11 @@ def encode_media(
     if audio_inputs or media.audio_edit is not None:
         if audio_vae is None:
             raise RuntimeError("MiniMax H3 audio WVAE is not resident on the encoder leader")
-        with component_scope(audio_vae):
-            for waveform, sample_rate in audio_inputs:
-                rows, length = audio_vae.encode_waveform(waveform, sample_rate)
+        early = [reference_audio.take(*item) if reference_audio is not None else None for item in audio_inputs]
+        needs_audio_vae = media.audio_edit is not None or any(encoded is None for encoded in early)
+        with component_scope(audio_vae) if needs_audio_vae else nullcontext():
+            for (waveform, sample_rate), encoded in zip(audio_inputs, early, strict=True):
+                rows, length = encoded if encoded is not None else audio_vae.encode_waveform(waveform, sample_rate)
                 audio_rows.append(rows)
                 audio_lengths.append(int(length))
             if media.audio_edit is not None:

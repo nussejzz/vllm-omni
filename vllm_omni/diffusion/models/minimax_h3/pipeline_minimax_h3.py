@@ -98,6 +98,8 @@ from vllm_omni.model_executor.models.minimax_h3.continuation_request import (
 )
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     PreparedEncoderInputs,
+    ReferenceAudioEncodings,
+    audio_encode_early,
     continuation_inherits_source_canvas,
     encode_media,
     prepare_encoder_inputs,
@@ -3364,7 +3366,22 @@ class MiniMaxH3Pipeline(
             tensors[name] = _broadcast_tensor(source, dtype=dtype, device=self.device) if dtype is not None else None
         return MiniMaxH3EncoderMediaConditioning(**metadata, **tensors)
 
-    def _encode_local_media(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaConditioning:
+    def _early_reference_audio(self) -> ReferenceAudioEncodings | None:
+        """Rows rank 0 encodes for Ref2VA reference audio while the reference frames decode.
+
+        None (``VLLM_OMNI_H3_AUDIO_ENCODE_EARLY=0``, or no audio WVAE encoder)
+        keeps the audio encode after the video VAE in :meth:`_encode_local_media`.
+        """
+        audio_vae = getattr(self, "audio_vae", None)
+        if audio_vae is None or getattr(audio_vae, "decode_only", False) or not audio_encode_early():
+            return None
+        return ReferenceAudioEncodings(audio_vae, component_scope=self._component_on_device)
+
+    def _encode_local_media(
+        self,
+        media: MiniMaxH3EncoderMediaInput | None,
+        reference_audio: ReferenceAudioEncodings | None = None,
+    ) -> MiniMaxH3EncoderMediaConditioning:
         group, rank, world_size = _dit_rank_world()
         distributed_video = self.video_vae.is_distributed_enabled()
         if distributed_video:
@@ -3382,6 +3399,7 @@ class MiniMaxH3Pipeline(
                         audio_vae=self.audio_vae,
                         emit_conditioning=rank == 0,
                         component_scope=self._component_on_device,
+                        reference_audio=reference_audio,
                     )
         except ValueError as exc:
             error = OmniClientError(str(exc))
@@ -3430,6 +3448,7 @@ class MiniMaxH3Pipeline(
         group, rank, world_size = _dit_rank_world()
         prompts = (sampling.extra_args or {}).get("continuation_prompts")
         prepared = text_conditioning = None
+        reference_audio = None
         initial_noise_params = None
         visual_noise_params = None
         error = None
@@ -3465,12 +3484,14 @@ class MiniMaxH3Pipeline(
                     raise OmniClientError(
                         "MiniMax H3 diffusion stage requires text encoder conditioning when text_encoder is not loaded"
                     )
+                reference_audio = self._early_reference_audio()
                 with h3_range("h3.encode.rank0_prepare_inputs"):
                     prepared = prepare_encoder_inputs(
                         raw_prompt,
                         sampling,
                         task=task,
                         prepared_reference_videos=self._extract_prepared_reference_videos(raw_prompt),
+                        reference_audio=reference_audio,
                     )
                 continuation = None
                 if prompts is not None or (request_context is not None and task == "ref2va"):
@@ -3567,7 +3588,11 @@ class MiniMaxH3Pipeline(
                     logger.info("MiniMax H3 encoding continuation prompt %d/%d", index, len(prompts))
                     window_text.append(self.encode_prompt(replace(prepared, prompt=prompt) if rank == 0 else None))
             with h3_range("h3.encode.media"):
-                media = self._encode_local_media(prepared.media if prepared is not None else None)
+                media = self._encode_local_media(
+                    prepared.media if prepared is not None else None,
+                    # Only rank 0 holds rows, and only once it has encoded some.
+                    **({"reference_audio": reference_audio} if reference_audio else {}),
+                )
             if initial_noise is not None:
                 assert request_context is not None
                 request_context["precomputed_initial_noise"] = initial_noise.result()
