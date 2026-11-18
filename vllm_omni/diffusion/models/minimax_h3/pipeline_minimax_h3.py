@@ -519,6 +519,51 @@ def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any
             component.set_omni_component_cache(cache)
 
 
+# Transitional switch for stage-boundary releases without a DLO component
+# cache: unset or "bounded" returns idle allocator pages only past the
+# BoundedAllocatorCache bounds where ``_retains_stage_cache`` allows it,
+# "force" restores the unconditional empty_cache at every boundary.
+MINIMAX_H3_STAGE_CACHE_RELEASE_ENV = "VLLM_OMNI_H3_STAGE_CACHE_RELEASE"
+_STAGE_CACHE_RELEASE_MODES = ("bounded", "force")
+
+
+def _stage_cache_release_mode() -> str:
+    raw = os.environ.get(MINIMAX_H3_STAGE_CACHE_RELEASE_ENV, "").strip()
+    mode = raw or "bounded"
+    if mode not in _STAGE_CACHE_RELEASE_MODES:
+        raise ValueError(f"{MINIMAX_H3_STAGE_CACHE_RELEASE_ENV} must be 'bounded' or 'force', got {raw!r}")
+    return mode
+
+
+# Reject an invalid switch value when the model is imported rather than at the
+# first stage boundary; releases still read it, so it can change between requests.
+_stage_cache_release_mode()
+
+
+def _retains_stage_cache(pipeline: Any) -> bool:
+    """Whether ``pipeline`` may keep idle allocator pages at stage boundaries.
+
+    The bounds see only this process's allocator, and the retained pages were
+    measured only for a fully resident pipeline on discrete devices. Every
+    other setup keeps the forced release: a pipeline class that opts out (the
+    decoder-only stage shares its devices with other stage processes, whose
+    allocators cannot reclaim these pages), any offload strategy or HSDP
+    weight sharding (the low-memory deployments the forced releases were
+    added for; HSDP's all-gather stream also caches blocks the compute stream
+    cannot reuse), and an integrated device, whose cached pages are host
+    memory.
+    """
+    od_config = getattr(pipeline, "od_config", None)
+    if not getattr(pipeline, "_bounded_stage_cache_release", False) or od_config is None:
+        return False
+    if resolve_offload_strategy(od_config) is not OffloadStrategy.NONE:
+        return False
+    if getattr(getattr(od_config, "parallel_config", None), "use_hsdp", False):
+        return False
+    device = pipeline.device
+    return device.type != "cuda" or not torch.cuda.get_device_properties(device).is_integrated
+
+
 def _device_prefix(continuation: LatentContinuation, device: torch.device) -> LatentPrefix:
     prefix = continuation.prefix
     return replace(prefix, video=prefix.video.to(device=device), audio=prefix.audio.to(device=device))
@@ -789,6 +834,9 @@ class MiniMaxH3Pipeline(
         "post_decode",
     ]
     dummy_run_num_frames: ClassVar[int] = 0
+    # Stage boundaries may keep idle allocator pages within bounds; see
+    # ``_retains_stage_cache``.
+    _bounded_stage_cache_release: ClassVar[bool] = True
     # Only distilled releases pin a schedule, so the default keeps the legacy
     # uniform path available to partially constructed pipelines.
     _base_schedule_by_partition: ClassVar[Mapping[str, DMD2SigmaSchedule | None]] = {}
@@ -2127,8 +2175,9 @@ class MiniMaxH3Pipeline(
                 )
                 rows.append(video_rows)
                 shapes.extend(video_shapes)
-        # The latents are extracted; the encode's input/staging pages are idle
-        # and must not stay mapped through the denoise and decode peaks.
+        # The latents are extracted; the encode's input/staging pages are idle.
+        # Hand them to the stage-boundary release policy before the denoise
+        # and decode peaks (see _release_stage_cache).
         if needs_video_vae:
             self._release_stage_cache()
         return (torch.cat(rows) if rows else None), shapes
@@ -2871,13 +2920,24 @@ class MiniMaxH3Pipeline(
     def _release_stage_cache(self) -> None:
         """Return idle allocator pages to the device at stage boundaries.
 
-        The bounded component cache releases only past its idle-cache bound
-        (>25% of device capacity), which on large devices lets a finished
-        stage's freed activations -- the DiT's denoise buffers, an encode
-        input, a decoded frame tensor -- stay physically mapped across the
-        next stage's peak. Forcing the release at a boundary is exact (only
-        free pages are returned; live tensors are untouched) and costs one
-        remap per later allocation.
+        With a DLO component cache the release is forced: that cache releases
+        only past its idle-cache bound (>25% of device capacity), which on
+        large devices lets a finished stage's freed activations -- the DiT's
+        denoise buffers, an encode input, a decoded frame tensor -- stay
+        physically mapped across the next stage's peak. Forcing the release
+        at a boundary is exact (only free pages are returned; live tensors
+        are untouched) and costs one remap per later allocation.
+
+        Without one, a fully resident pipeline on discrete devices (see
+        ``_retains_stage_cache``) releases only past the same bounds; every
+        other setup keeps the forced release. A forced release returns pages
+        the next stage maps straight back: on 8xH200 USP8 it measured
+        ~0.6 s per request (the driver unmap/release calls serialize across
+        the ranks, and the next stage remaps the pages), while in that configuration the retained pages
+        stay far inside the bounds. The bounds see only this process's
+        allocator, so a deployment that places another stage process on the
+        same devices should set ``VLLM_OMNI_H3_STAGE_CACHE_RELEASE=force``,
+        which restores the forced release everywhere.
         """
         cache = getattr(self, "_dlo_component_cache", None)
         if cache is not None:
@@ -2886,6 +2946,13 @@ class MiniMaxH3Pipeline(
             except BaseException:
                 logger.exception("Failed to release retained allocator cache at stage boundary")
             return
+        if _stage_cache_release_mode() == "bounded":
+            stage_cache = getattr(self, "_stage_allocator_cache", None)
+            if stage_cache is None and _retains_stage_cache(self):
+                stage_cache = self._stage_allocator_cache = BoundedAllocatorCache(self.device)
+            if stage_cache is not None:
+                stage_cache.release_if_needed()
+                return
         current_omni_platform.empty_cache()
 
     def decode(
@@ -2896,9 +2963,11 @@ class MiniMaxH3Pipeline(
         height: int,
         width: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Denoise just ended: its freed activation pages must not stay mapped
-        # through the VAE decode peak. Decoding needs only the ViT decoder
-        # half of the VAE, so the CNN encoder stays off the device.
+        # Denoise just ended: its freed activation pages are idle, and the
+        # stage-boundary release policy decides whether they stay mapped
+        # through the VAE decode peak (see _release_stage_cache). Decoding
+        # needs only the ViT decoder half of the VAE, so the CNN encoder stays
+        # off the device.
         with h3_range("h3.decode.release_stage_cache"):
             self._release_stage_cache()
         with h3_range("h3.decode.video_vae"):
@@ -4363,15 +4432,17 @@ class MiniMaxH3Pipeline(
                     video, audio = trim_decoded_overlap(video, audio, **trim)
                 # Rebind rather than append the expression: the local would
                 # otherwise keep the decoded frames' device storage alive for the
-                # rest of the iteration, and the next seed's diffuse() -- the DiT
-                # reload this release exists to make room for -- runs before the
-                # loop rebinds it. post_decode() rebinds for the same reason.
+                # rest of the iteration, and the next seed's diffuse() -- under
+                # model-level offload, the DiT reload this release makes room
+                # for -- runs before the loop rebinds it. post_decode() rebinds
+                # for the same reason.
                 with h3_range("h3.post.video_output"):
                     video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
                 videos.append(video)
                 # The FP32 decoded frames are quantized into the appended uint8
-                # tensor; drop the reference and return the idle pages instead of
-                # holding them through the next output's denoise/decode.
+                # tensor; drop the reference so the stage-boundary release policy
+                # can return the idle pages before the next output's
+                # denoise/decode (see _release_stage_cache).
                 del video
                 with h3_range("h3.post.release_stage_cache"):
                     self._release_stage_cache()

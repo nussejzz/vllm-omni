@@ -267,6 +267,9 @@ _MODEL_INTERNALIZE = (
     # MiniMax-H3: transitional rollback/A-B switch for direct reference-video
     # frame decoding (0 = lossless prepared.mp4 round trip).
     "VLLM_OMNI_H3_REFERENCE_DECODE_WORKERS",
+    # MiniMax-H3: transitional rollback/A-B switch for stage-boundary allocator
+    # releases without a DLO component cache (force = empty_cache every time).
+    "VLLM_OMNI_H3_STAGE_CACHE_RELEASE",
     # CI-only fallback for memory-constrained MOSS Realtime qualification.
     "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE",
     "VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR",

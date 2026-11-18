@@ -61,6 +61,11 @@ class MiniMaxH3DecoderPipeline(
     _encoder_modules: ClassVar[list[str]] = []
     _vae_modules: ClassVar[list[str]] = ["video_vae", "audio_vae"]
     _PROFILER_TARGETS: ClassVar[list[str]] = ["decode", "video_vae.decode_latent", "audio_vae.decode_latent"]
+    # The decoder stage shares its devices with the DiT and encoder stage
+    # processes (minimax_h3_disaggregated_decode), whose allocators cannot
+    # reclaim pages this process keeps cached: every stage boundary forces
+    # the release.
+    _bounded_stage_cache_release: ClassVar[bool] = False
 
     # Reuse decoding behavior to preserve regular and chunked MP4 output contracts.
     decode = MiniMaxH3Pipeline.decode
