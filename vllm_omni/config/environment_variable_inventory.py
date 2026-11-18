@@ -276,6 +276,9 @@ _MODEL_INTERNALIZE = (
     # MiniMax-H3: transitional rollback/A-B switch for stage-boundary allocator
     # releases without a DLO component cache (force = empty_cache every time).
     "VLLM_OMNI_H3_STAGE_CACHE_RELEASE",
+    # MiniMax-H3: transitional rollback/A-B switch for the cross-clip VAE tile
+    # schedule (0 = one tile schedule and gather per temporal clip).
+    "VLLM_OMNI_H3_VAE_GLOBAL_TILES",
     # CI-only fallback for memory-constrained MOSS Realtime qualification.
     "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE",
     "VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR",

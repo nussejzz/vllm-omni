@@ -19,6 +19,10 @@ at adapter construction:
   delivered video is bit-identical while the resident decode buffer shrinks
   4x.
 
+Both forks schedule the spatial tiles of all their temporal clips at once
+when the checkpoint tiles in parallel (``vae_global_tiles``; roll back with
+``VLLM_OMNI_H3_VAE_GLOBAL_TILES=0``).
+
 Set ``VLLM_OMNI_VAE_LEGACY_TEMPORAL=1`` to keep the checkpoint's methods.
 """
 
@@ -33,6 +37,7 @@ import torch
 from vllm.logger import init_logger
 
 from .profiling import h3_range
+from .vae_global_tiles import global_tile_state, global_tiled_decode, global_tiled_encode
 
 logger = init_logger(__name__)
 
@@ -48,7 +53,9 @@ def _encode_temporal_tail_pad(self, x):
     """Drop-in fork of the checkpoint's ``encode_temporal``.
 
     Frame handling is identical to the original; only the padding site
-    moves from a whole-video ``torch.cat`` into the tail chunk.
+    moves from a whole-video ``torch.cat`` into the tail chunk. When the
+    checkpoint tiles in parallel, the clips' tiles share one schedule
+    (``vae_global_tiles``); each clip's moments are unchanged.
     """
     offset_frame = 1 if self.isolated_first_frame and self.frame_pre_padding == 0 else 0
 
@@ -57,8 +64,7 @@ def _encode_temporal_tail_pad(self, x):
     padded_frames = orig_frames + pad_size
     num_chunks = (padded_frames - offset_frame) // self.clip_length
 
-    z_list = []
-    for i in range(num_chunks):
+    def clip_input(i):
         start_idx = i * self.clip_length + offset_frame
         end_idx = (i + 1) * self.clip_length + offset_frame
         clip_x = x[:, :, start_idx : min(end_idx, orig_frames), :, :]
@@ -70,22 +76,35 @@ def _encode_temporal_tail_pad(self, x):
                 [clip_x, clip_x[:, :, -1:].repeat(1, 1, end_idx - orig_frames, 1, 1)],
                 dim=2,
             )
+        return clip_x
 
-        with h3_range(f"h3.vae_video.encode_clip.{i}"):
-            if self.isolated_key_frame:
-                key_frame = clip_x[:, :, :1, :, :]
-                z_key = self._adaptive_encode(key_frame)
+    z_list = None
+    # A key-frame split encodes two shapes per clip; it keeps the per-clip
+    # schedule, as does a single clip (nothing to balance).
+    state = None if self.isolated_key_frame or num_chunks < 2 else global_tile_state(self, decoder=False)
+    if state is not None:
+        with h3_range("h3.vae_video.encode_global_tiles"):
+            z_list = global_tiled_encode(self, state, [clip_input(i) for i in range(num_chunks)])
 
-                if clip_x.shape[2] > 1:
-                    video_frames = clip_x[:, :, 1:, :, :]
-                    z_video = self._adaptive_encode(video_frames)
-                    z = torch.cat([z_key, z_video], dim=2)
+    if z_list is None:
+        z_list = []
+        for i in range(num_chunks):
+            clip_x = clip_input(i)
+            with h3_range(f"h3.vae_video.encode_clip.{i}"):
+                if self.isolated_key_frame:
+                    key_frame = clip_x[:, :, :1, :, :]
+                    z_key = self._adaptive_encode(key_frame)
+
+                    if clip_x.shape[2] > 1:
+                        video_frames = clip_x[:, :, 1:, :, :]
+                        z_video = self._adaptive_encode(video_frames)
+                        z = torch.cat([z_key, z_video], dim=2)
+                    else:
+                        z = z_key
                 else:
-                    z = z_key
-            else:
-                z = self._adaptive_encode(clip_x)
+                    z = self._adaptive_encode(clip_x)
 
-        z_list.append(z)
+            z_list.append(z)
 
     z = torch.cat(z_list, dim=2)
     if self.token_drop > 0:
@@ -136,6 +155,8 @@ def _decode_temporal_streaming_uint8(
     identical to the original. ``write_part`` additionally runs the
     denormalize -> clamp -> quantize chain in place (the same op order the
     pipeline applies after decode) and accumulates into a uint8 buffer.
+    When the checkpoint tiles in parallel, the clips' tiles share one
+    schedule (``vae_global_tiles``); each decoded clip is unchanged.
     """
     total_frames, pad_frames, output_frames = self._decode_temporal_output_frame_plan(
         z, z_head, z_tail, num_chunks, pad_tokens
@@ -195,7 +216,7 @@ def _decode_temporal_streaming_uint8(
                 write_pos += copy_frames
             dropped_frames += part_frames - copy_frames
 
-    for i in range(num_chunks):
+    def clip_latent(i):
         t_start_idx = i * self.tokens_chunk_size
         t_end_idx = t_start_idx + self.tokens_chunk_size + self.token_overlap
         clip_z = z[:, :, t_start_idx:t_end_idx, :, :]
@@ -205,9 +226,26 @@ def _decode_temporal_streaming_uint8(
 
         if i == num_chunks - 1 and z_tail is not None:
             clip_z = torch.cat([clip_z, z_tail], dim=2)
+        return clip_z
+
+    # Clips decode independently (the temporal overlap is blended below,
+    # after decode), so when the checkpoint tiles in parallel every clip's
+    # tiles can share one schedule; ``assemble(i)`` then returns exactly what
+    # ``_adaptive_decode`` returns for clip i.
+    global_clips = None
+    state = None if num_chunks < 2 else global_tile_state(self, decoder=True)
+    if state is not None:
+        with h3_range("h3.vae_video.decode_global_tiles"):
+            global_clips = global_tiled_decode(self, state, [clip_latent(i) for i in range(num_chunks)])
+
+    for i in range(num_chunks):
+        clip_z = clip_latent(i)
 
         with h3_range(f"h3.vae_video.clip_decode.{i}"):
-            clip_dec = self._adaptive_decode(clip_z)
+            if global_clips is None:
+                clip_dec = self._adaptive_decode(clip_z)
+            else:
+                clip_dec = global_clips.assemble(i)
         decoded_count += 1
         if temporal_cat_dtype is not None and clip_dec.dtype != temporal_cat_dtype:
             clip_dec = clip_dec.to(temporal_cat_dtype)
