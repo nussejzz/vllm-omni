@@ -253,7 +253,8 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
                 enabled="all",
                 context="all",
                 stacks="python",
-                max_entries=100000,
+                # Default 100k entries ends mid-request for long diffusion requests (e.g. H3 needs ~170k).
+                max_entries=int(os.environ.get("VLLM_OMNI_TORCH_MEMORY_HISTORY_MAX_ENTRIES", "100000")),
                 clear_history=True,
             )
             self._memory_history_enabled = True
