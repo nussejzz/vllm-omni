@@ -1187,7 +1187,12 @@ def encode_media(
                 visual_rows.append(video_vae.encode_image(image))
                 visual_shapes.append((1, image.height // 16, image.width // 16))
             for value in media.videos:
-                frames = np.asarray(value.detach().cpu().to(torch.uint8).contiguous().numpy())
+                if value.device.type == "cpu":
+                    frames = np.asarray(value.detach().cpu().to(torch.uint8).contiguous().numpy())
+                else:
+                    # DiT ranks 1-7 keep the broadcast reference on the device;
+                    # the video VAE normalizes it clip by clip in place.
+                    frames = value.detach().to(torch.uint8).contiguous()
                 rows, shape = video_vae.encode_video(frames)
                 visual_rows.append(rows)
                 visual_shapes.append(tuple(int(item) for item in shape))

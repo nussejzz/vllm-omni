@@ -6,6 +6,7 @@ import time
 from datetime import timedelta
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -52,6 +53,7 @@ def _collective_worker(rank, rendezvous, backend):
             def encode_video(self, frames):
                 self.collective()
                 assert frames.shape == (4, 32, 32, 3)
+                self.received = frames
                 if self.fail and rank == 1:
                     raise ValueError("codec failed on rank 1")
                 return torch.full((1, 96), 2.0), (1, 2, 2)
@@ -117,6 +119,19 @@ def _collective_worker(rank, rendezvous, backend):
         )
         torch.testing.assert_close(conditioning.audio_condition.cpu(), torch.full((160, 32), 3.0))
         assert conditioning.audio_condition_lengths == (80,)
+        # Rank 1 keeps the broadcast reference video on the device unless the
+        # transitional switch restores the host copy.
+        received = model.video_vae.received
+        if rank == 1 and backend == "nccl":
+            assert isinstance(received, torch.Tensor) and received.device == device
+        else:
+            assert isinstance(received, np.ndarray)
+        os.environ[module.MINIMAX_H3_RANK_GPU_REFERENCE_FRAMES_ENV] = "0"
+        try:
+            model._encode_local_media(media)
+        finally:
+            del os.environ[module.MINIMAX_H3_RANK_GPU_REFERENCE_FRAMES_ENV]
+        assert isinstance(model.video_vae.received, np.ndarray)
 
         model.video_vae.fail = True
         with pytest.raises(OmniClientError, match="codec failed on rank 1"):

@@ -264,6 +264,9 @@ _MODEL_INTERNALIZE = (
     "VLLM_OMNI_CODE2WAV_STATS",
     # MiniMax-H3: opt-in torch.profiler ranges inside the DiT forward.
     "VLLM_OMNI_H3_PROFILE_DIT_DETAIL",
+    # MiniMax-H3: transitional rollback/A-B switch for keeping broadcast
+    # reference-video frames on the device on DiT ranks 1-7 (0 = host copy).
+    "VLLM_OMNI_H3_RANK_GPU_REFERENCE_FRAMES",
     # MiniMax-H3: transitional rollback/A-B switch for direct reference-video
     # frame decoding (0 = lossless prepared.mp4 round trip).
     "VLLM_OMNI_H3_REFERENCE_DECODE_WORKERS",

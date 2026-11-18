@@ -639,6 +639,31 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "0").strip().lower() not in ("", "0", "false", "off")
 
 
+# Transitional rollback/A-B switch for keeping broadcast reference videos on
+# the device on DiT ranks 1-7 (0 = previous pageable host copy).
+MINIMAX_H3_RANK_GPU_REFERENCE_FRAMES_ENV = "VLLM_OMNI_H3_RANK_GPU_REFERENCE_FRAMES"
+
+
+def rank_gpu_reference_frames() -> bool:
+    """Whether DiT ranks 1-7 keep broadcast reference-video frames on the device.
+
+    Unset (or ``1``) leaves the uint8 frames where the broadcast wrote them,
+    and the video VAE normalizes each clip from there. ``0`` restores the
+    pageable device-to-host copy and the per-clip re-upload in the VAE.
+    """
+    raw = os.environ.get(MINIMAX_H3_RANK_GPU_REFERENCE_FRAMES_ENV, "").strip().lower()
+    if raw in ("", "1", "true", "on"):
+        return True
+    if raw in ("0", "false", "off"):
+        return False
+    raise ValueError(f"{MINIMAX_H3_RANK_GPU_REFERENCE_FRAMES_ENV} must be 0 or 1, got {raw!r}")
+
+
+# Reject an invalid switch value when the model is imported rather than on
+# every request; requests still read it, so it can change between them.
+rank_gpu_reference_frames()
+
+
 def _additional_flag(od_config: Any, key: str) -> bool:
     value = (getattr(od_config, "additional_config", None) or {}).get(key, False)
     if type(value) is not bool:
@@ -3280,11 +3305,18 @@ class MiniMaxH3Pipeline(
         header = [(media.to_metadata(), [value.dtype for value in tensors])] if media is not None else [None]
         dist.broadcast_object_list(header, src=0, group=group)
         metadata, dtypes = header[0]
+        # Reference videos (they follow the images in to_mm_tensors) stay on
+        # the device: the video VAE normalizes them clip by clip in place, so
+        # the pageable device-to-host copy and its re-upload are skipped.
+        resident = range(0)
+        if rank != 0 and rank_gpu_reference_frames():
+            image_count = int(metadata.get("image_count", 0))
+            resident = range(image_count, image_count + int(metadata.get("video_count", 0)))
         received = []
         for index, dtype in enumerate(dtypes):
             value = _broadcast_tensor(tensors[index] if rank == 0 else None, dtype=dtype, device=self.device)
             if rank != 0:
-                received.append(value.cpu())
+                received.append(value if index in resident else value.cpu())
             del value
         if rank == 0:
             assert media is not None

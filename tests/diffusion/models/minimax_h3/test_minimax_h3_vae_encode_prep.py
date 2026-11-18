@@ -241,3 +241,102 @@ def test_encode_video_falls_back_when_preparation_unsupported(monkeypatch):
     frames = _video(10)
     vae.encode_video(frames)
     assert vae.model.received is frames
+
+
+def _aligned_model(pad):
+    class _AlignedProcessor(_FakeProcessor):
+        def align_video_length(self, video_length, mode="pad", granularity="chunk"):
+            return pad
+
+    model = _FakeCheckpointModel()
+    model.processor = _AlignedProcessor()
+    return model
+
+
+@pytest.mark.parametrize(
+    ("num_frames", "model"),
+    [
+        (10, None),  # tail pad inside the last clip
+        (2, None),  # a single clip, mostly pad
+        (8, None),  # aligned, no pad
+        (10, _aligned_model(5)),  # pad longer than a clip: one clip is all pad
+    ],
+)
+def test_stream_prep_tensor_frames_match_host_path_bitwise(num_frames, model):
+    # DiT ranks 1-7 hand the VAE the uint8 tensor the broadcast wrote; it must
+    # normalize to exactly what the host numpy path uploads and normalizes.
+    frames = _video(num_frames)
+    vae = _vae(model)
+    expected = vae._stream_prepare_video_tensor(frames, torch.device("cpu"))
+    source = torch.from_numpy(frames.copy())
+    out = vae._stream_prepare_video_tensor(source, torch.device("cpu"))
+    assert out is not None
+    assert out.shape == expected.shape
+    assert torch.equal(out, expected)
+    assert torch.equal(source, torch.from_numpy(frames))  # the resident frames are not modified
+
+
+@pytest.mark.parametrize(
+    "frames",
+    [
+        torch.zeros(5, 6, 8, 3, dtype=torch.float32),  # not uint8
+        torch.zeros(5, 6, 8, 1, dtype=torch.uint8),  # single channel
+        torch.zeros(5, 6, 8, dtype=torch.uint8),  # missing channel axis
+        torch.zeros(0, 6, 8, 3, dtype=torch.uint8),  # empty
+    ],
+)
+def test_stream_prep_rejects_unsupported_tensor_inputs(frames):
+    assert _vae()._stream_prepare_video_tensor(frames, torch.device("cpu")) is None
+
+
+def test_device_uint8_video_detection():
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    assert vae_module._is_device_uint8_video(torch.empty(4, 6, 8, 3, dtype=torch.uint8, device="meta"))
+    assert not vae_module._is_device_uint8_video(torch.empty(4, 6, 8, 3, dtype=torch.float32, device="meta"))
+    assert not vae_module._is_device_uint8_video(torch.empty(4, 6, 8, 1, dtype=torch.uint8, device="meta"))
+    assert not vae_module._is_device_uint8_video(torch.zeros(4, 6, 8, 3, dtype=torch.uint8))  # host tensor
+    assert not vae_module._is_device_uint8_video(_video(4))
+
+
+def _treat_host_tensors_as_resident(monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3 import vae as vae_module
+
+    monkeypatch.setattr(
+        vae_module,
+        "_is_device_uint8_video",
+        lambda frames: isinstance(frames, torch.Tensor) and frames.dtype == torch.uint8 and frames.ndim == 4,
+    )
+
+
+def test_encode_video_normalizes_resident_tensor_frames(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_VAE_ENCODE_LEGACY_PREP", raising=False)
+    _treat_host_tensors_as_resident(monkeypatch)
+    frames = _video(10)
+    host = _vae_for_encode_video()
+    host_rows, host_shape = host.encode_video(frames)
+    resident = _vae_for_encode_video()
+    resident.model.latent = host.model.latent
+    rows, shape = resident.encode_video(torch.from_numpy(frames.copy()))
+    assert isinstance(resident.model.received, list)
+    assert torch.equal(resident.model.received[0], host.model.received[0])
+    assert shape == host_shape
+    assert torch.equal(rows, host_rows)
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_encode_video_resident_tensor_falls_back_to_host_numpy(monkeypatch, legacy):
+    # Legacy prep and an undiscoverable contract both hand the checkpoint the
+    # host numpy array encode_media used to build.
+    _treat_host_tensors_as_resident(monkeypatch)
+    if legacy:
+        monkeypatch.setenv("VLLM_OMNI_VAE_ENCODE_LEGACY_PREP", "1")
+    else:
+        monkeypatch.delenv("VLLM_OMNI_VAE_ENCODE_LEGACY_PREP", raising=False)
+    vae = _vae_for_encode_video()
+    if not legacy:
+        vae.model.clip_length = None
+    frames = _video(10)
+    vae.encode_video(torch.from_numpy(frames.copy()))
+    assert isinstance(vae.model.received, np.ndarray)
+    assert np.array_equal(vae.model.received, frames)
