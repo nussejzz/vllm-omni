@@ -32,6 +32,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     STREAMING_RESPONSE_ENCODING_KEY,
     _encode_video_bytes,
     _PlanarFrameConverter,
+    response_encoder_build,
     usable_cpu_count,
 )
 
@@ -85,6 +86,7 @@ def _spec(frame_path="direct_planar", **overrides):
         "frame_path": frame_path,
         "video_codec_options": SERVING_OPTIONS,
         "affinity_cpus": usable_cpu_count(),
+        "encoder_build": response_encoder_build(),
         "fps": None,
     }
     spec.update(overrides)
@@ -220,8 +222,22 @@ def test_resolve_stream_mp4_request(monkeypatch):
     # libx264 would size its threads, and so its slices, differently.
     mismatch = _spec(affinity_cpus=usable_cpu_count() + 1)
     assert resolve_stream_mp4_request({STREAMING_RESPONSE_ENCODING_KEY: mismatch}) is None
+    # Another host or media build may encode the same frames differently.
+    for build in (None, response_encoder_build() + "-other"):
+        other = _spec(encoder_build=build)
+        assert resolve_stream_mp4_request({STREAMING_RESPONSE_ENCODING_KEY: other}) is None
     monkeypatch.setenv(MINIMAX_H3_STREAM_MP4_ENV, "0")
     assert resolve_stream_mp4_request({STREAMING_RESPONSE_ENCODING_KEY: spec}) is None
+
+
+def test_resolve_stream_mp4_request_without_pyav(monkeypatch):
+    monkeypatch.delenv(MINIMAX_H3_STREAM_MP4_ENV, raising=False)
+
+    def missing():
+        raise ImportError("av")
+
+    monkeypatch.setattr(stream_mp4, "response_encoder_build", missing)
+    assert resolve_stream_mp4_request({STREAMING_RESPONSE_ENCODING_KEY: _spec()}) is None
 
 
 @pytest.mark.parametrize(("value", "expected"), [("", True), ("1", True), ("0", False), ("off", False)])
@@ -236,7 +252,7 @@ def test_stream_mp4_env_rejects_unknown_values(monkeypatch):
         stream_mp4.stream_mp4_enabled()
 
 
-def _forward(extra_args, *, num_outputs=1, height=64, width=80):
+def _forward(extra_args, *, num_outputs=1, height=64, width=80, sampling=None):
     from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
 
     z = _latent()
@@ -258,7 +274,8 @@ def _forward(extra_args, *, num_outputs=1, height=64, width=80):
         _offload_model_cpu_stage_output=lambda value: value,
         _release_stage_cache=lambda: releases.append(True),
     )
-    request = SimpleNamespace(prompts=["a prompt"], sampling_params=SimpleNamespace(extra_args=extra_args))
+    sampling_params = SimpleNamespace(extra_args=extra_args, **(sampling or {}))
+    request = SimpleNamespace(prompts=["a prompt"], sampling_params=sampling_params)
     output = MiniMaxH3Pipeline.forward(pipeline, request)
     expected = _api_bytes(_decode(z)[..., :height, :width].contiguous(), audio)
     return output, expected, releases
@@ -305,3 +322,30 @@ def test_forward_keeps_the_raw_frame_path(monkeypatch, env, extra_args, num_outp
         == expected
     )
     assert np.asarray(video).shape[0] == num_outputs
+
+
+@pytest.mark.parametrize("case", ["frame-interpolation", "peer-rank", "continuation-trim"])
+def test_forward_streams_only_frames_the_api_would_encode_as_decoded(monkeypatch, case):
+    """Interpolated, peer-rank and trimmed outputs never start a stream."""
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as module
+
+    monkeypatch.delenv(MINIMAX_H3_STREAM_MP4_ENV, raising=False)
+    started = []
+    monkeypatch.setattr(module, "MiniMaxH3ResponseMP4Stream", lambda *args, **kwargs: started.append(True))
+    sampling = {}
+    dropped = 0
+    if case == "frame-interpolation":
+        sampling["enable_frame_interpolation"] = True
+    elif case == "peer-rank":
+        monkeypatch.setattr(module.MiniMaxH3Pipeline, "_is_output_owner_rank", staticmethod(lambda: False))
+    else:
+        dropped = 2
+        monkeypatch.setattr(module, "_continuation_trim", lambda continuation: {"frames": dropped})
+        monkeypatch.setattr(module, "trim_decoded_overlap", lambda video, audio, frames: (video[:, :, frames:], audio))
+
+    output, _, _ = _forward({STREAMING_RESPONSE_ENCODING_KEY: _spec()}, sampling=sampling)
+
+    assert started == []
+    video, _ = output.output
+    assert isinstance(video, torch.Tensor) and video.dtype == torch.uint8
+    assert video.shape[1] == NUM_CHUNKS * 2 + 1 - dropped

@@ -39,6 +39,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     _encode_video_bytes,
     _PlanarFrameConverter,
     encode_video_base64,
+    response_encoder_build,
     streaming_response_frame_path,
     usable_cpu_count,
 )
@@ -233,6 +234,8 @@ class OmniOpenAIServingVideo:
         returns the bytes instead of frames; anything else ignores it.
         ``affinity_cpus`` is taken on this thread, where the encoder runs:
         libx264 sizes its threads, and so its slices, from it.
+        ``encoder_build`` names this host and media build, which a pipeline
+        process must share for its encode to be this one.
         """
         frame_path = streaming_response_frame_path(
             frame_converter=self._video_frame_converter,
@@ -240,10 +243,16 @@ class OmniOpenAIServingVideo:
         )
         if frame_path is None:
             return None
+        try:
+            encoder_build = response_encoder_build()
+        except ImportError:
+            # Without PyAV there is no API encode for a pipeline to reproduce.
+            return None
         return {
             "frame_path": frame_path,
             "video_codec_options": video_codec_options,
             "affinity_cpus": usable_cpu_count(),
+            "encoder_build": encoder_build,
         }
 
     def _resolve_video_generation_defaults(

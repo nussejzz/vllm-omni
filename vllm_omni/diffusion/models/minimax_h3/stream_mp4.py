@@ -9,7 +9,9 @@ the API encodes it. When the API announces, through
 ``STREAMING_RESPONSE_ENCODING_KEY``, how it would encode the frames, the
 output rank instead hands every range of frames the streaming decode
 finalizes to one :class:`StreamingVideoBytesEncoder` with exactly those
-settings, and returns the MP4 bytes.
+settings, and returns the MP4 bytes. It streams only when it runs on the
+API's host with the API's PyAV/FFmpeg build and CPU count, the inputs besides
+frames and settings that decide the bitstream.
 
 The decode itself is unchanged: frames are copied out of the decode's own
 ``uint8`` buffer after their final write, and the finished video must equal
@@ -33,6 +35,7 @@ from vllm_omni.entrypoints.openai.video_api_utils import (
     STREAMING_RESPONSE_ENCODING_KEY,
     STREAMING_RESPONSE_FRAME_PATHS,
     StreamingVideoBytesEncoder,
+    response_encoder_build,
     usable_cpu_count,
 )
 
@@ -78,6 +81,18 @@ def resolve_stream_mp4_request(extra_args: Mapping[str, Any] | None) -> dict[str
         return None
     options = spec.get("video_codec_options")
     if options is not None and not isinstance(options, Mapping):
+        return None
+    # A different host or PyAV/FFmpeg build may encode the same frames differently.
+    try:
+        build = response_encoder_build()
+    except ImportError:
+        return None
+    if spec.get("encoder_build") != build:
+        logger.info_once(
+            "MiniMax-H3 response MP4 is encoded by the API: its encoder build is %s, this worker's %s",
+            spec.get("encoder_build"),
+            build,
+        )
         return None
     # libx264's automatic thread (and slice) count follows the CPUs the
     # encoding thread may use; a different count would change the bitstream.

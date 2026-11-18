@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import os
 import queue
+import socket
 import tempfile
 import threading
 from collections import deque
@@ -1010,6 +1012,24 @@ def usable_cpu_count() -> int:
         return len(os.sched_getaffinity(0))
     except AttributeError:  # sched_getaffinity is Linux-only.
         return os.cpu_count() or 1
+
+
+@functools.lru_cache(maxsize=1)
+def response_encoder_build() -> str:
+    """Name the host and the PyAV/FFmpeg build this process encodes response MP4s with.
+
+    The same frames and settings give the same bytes only on the same
+    encoder: the libraries' versions and the host's CPU (swscale and libx264
+    pick code paths per CPU) both shape the bitstream. A process may stand in
+    for the API's encode only when it reports the API's build.
+    """
+    import av
+
+    libraries = ",".join(
+        f"{name}={'.'.join(str(part) for part in version)}" for name, version in sorted(av.library_versions.items())
+    )
+    ffmpeg = getattr(av, "ffmpeg_version_info", "")
+    return f"host={socket.gethostname()};pyav={av.__version__};ffmpeg={ffmpeg};{libraries}"
 
 
 def streaming_response_frame_path(

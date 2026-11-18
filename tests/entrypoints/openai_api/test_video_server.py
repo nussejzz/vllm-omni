@@ -4505,6 +4505,7 @@ def test_encoding_video_requests_describe_their_response_mp4(mocker: MockerFixtu
         "frame_path": "direct_planar",
         "video_codec_options": {"preset": "ultrafast", "threads": "0"},
         "affinity_cpus": video_api_utils.usable_cpu_count(),
+        "encoder_build": video_api_utils.response_encoder_build(),
         "fps": expected_fps,
     }
 
@@ -4531,6 +4532,20 @@ def test_requests_that_are_not_encoded_carry_no_response_mp4_description():
     forged = {video_api_utils.STREAMING_RESPONSE_ENCODING_KEY: {"frame_path": "direct_planar"}}
     try:
         asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="p", extra_params=forged), "frames"))
+    finally:
+        handler.shutdown()
+
+    assert video_api_utils.STREAMING_RESPONSE_ENCODING_KEY not in engine.captured_sampling_params_list[0].extra_args
+
+
+def test_response_mp4_description_needs_the_api_encoder(mocker: MockerFixture):
+    """Without PyAV the API has no encode for a pipeline to reproduce."""
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"encoded-video")
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video.response_encoder_build", side_effect=ImportError("av"))
+    try:
+        asyncio.run(handler.generate_video_bytes(VideoGenerationRequest(prompt="p"), "no-encoder"))
     finally:
         handler.shutdown()
 
