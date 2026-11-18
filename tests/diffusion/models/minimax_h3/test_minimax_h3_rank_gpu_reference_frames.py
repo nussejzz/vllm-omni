@@ -8,6 +8,7 @@ Ref2VA case, re-uploaded by the video VAE right after. Videos now stay where
 the broadcast wrote them unless ``VLLM_OMNI_H3_RANK_GPU_REFERENCE_FRAMES=0``.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -83,6 +84,18 @@ def test_nonzero_ranks_keep_reference_videos_resident(monkeypatch, value):
     assert copied == [True, False, False, True, True]
     assert all(torch.equal(a, b) for a, b in zip(result.to_mm_tensors(), media.to_mm_tensors(), strict=True))
     assert result.to_metadata() == media.to_metadata()
+
+
+def test_non_uint8_videos_keep_the_host_copy(monkeypatch):
+    # encode_media casts videos to uint8; that cast stays on the host for any
+    # other dtype so it cannot differ from the previous path.
+    monkeypatch.delenv(ENV, raising=False)
+    media = _media()
+    media = replace(media, videos=(media.videos[0].to(torch.float32), media.videos[1]))
+    result, copied = _distribute_on_rank(monkeypatch, 1, media)
+    assert copied == [True, True, False, True, True]
+    assert result.videos[0].dtype == torch.float32
+    assert all(torch.equal(a, b) for a, b in zip(result.to_mm_tensors(), media.to_mm_tensors(), strict=True))
 
 
 @pytest.mark.parametrize("value", ["0", "false", " off "])

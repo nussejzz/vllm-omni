@@ -3316,7 +3316,10 @@ class MiniMaxH3Pipeline(
         for index, dtype in enumerate(dtypes):
             value = _broadcast_tensor(tensors[index] if rank == 0 else None, dtype=dtype, device=self.device)
             if rank != 0:
-                received.append(value if index in resident else value.cpu())
+                # Only uint8 frames stay: encode_media casts each video to
+                # uint8, and a device-side cast from another dtype is not
+                # guaranteed to match the host cast byte for byte.
+                received.append(value if index in resident and dtype == torch.uint8 else value.cpu())
             del value
         if rank == 0:
             assert media is not None
