@@ -262,6 +262,8 @@ _MODEL_INTERNALIZE = (
     "MAGI2_ROUTER_BIAS_SOURCE",
     "NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE",
     "VLLM_OMNI_CODE2WAV_STATS",
+    # MiniMax-H3: opt-in torch.profiler ranges inside the DiT forward.
+    "VLLM_OMNI_H3_PROFILE_DIT_DETAIL",
     # MiniMax-H3: transitional rollback/A-B switch for direct reference-video
     # frame decoding (0 = lossless prepared.mp4 round trip).
     "VLLM_OMNI_H3_REFERENCE_DECODE_WORKERS",
@@ -320,6 +322,8 @@ _INTERNAL = (
     "VLLM_OMNI_DLO_DP_WAVE_TIMEOUT",
     "VLLM_OMNI_GROUP_NORM_SPLIT_WAVES",
     "VLLM_OMNI_REPLICA_ID",
+    # Torch profiler memory-history ring size (profiling only).
+    "VLLM_OMNI_TORCH_MEMORY_HISTORY_MAX_ENTRIES",
     # Removed in vLLM v0.16.0. Omni reads it only to emit a migration warning;
     # it does not enable profiling or register /start_profile.
     "VLLM_TORCH_PROFILER_DIR",
