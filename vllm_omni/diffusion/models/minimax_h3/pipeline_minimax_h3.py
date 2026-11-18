@@ -223,17 +223,20 @@ from .regenerate import (
     resolve_regenerate_adapter,
 )
 from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
+from .stream_mp4 import MiniMaxH3ResponseMP4Stream, resolve_stream_mp4_request
 from .time_request import (
     MINIMAX_H3_SHAPE_PLANNER,
     minimax_h3_time_shift_sigmas,
 )
 from .vae import (
+    MINIMAX_H3_AUDIO_CHANNELS,
     MiniMaxH3AudioVAE,
     MiniMaxH3VideoVAE,
     _load_component_config,
     _VideoVAEPartProxy,
     vae_compile_allowed,
 )
+from .vae_temporal import publish_decoded_frames
 from .vdnh3 import VDNCheckpoint
 
 if TYPE_CHECKING:
@@ -513,6 +516,42 @@ def _prepare_minimax_h3_video_output(video: torch.Tensor) -> torch.Tensor:
     # contiguous FP32 intermediate first (~4.2GB for a 15s clip).
     out.copy_(permuted)
     return out
+
+
+def _start_response_mp4_stream(
+    pipeline: MiniMaxH3Pipeline,
+    sampling_params: Any,
+    *,
+    height: int,
+    width: int,
+) -> MiniMaxH3ResponseMP4Stream | None:
+    """Start encoding the response MP4 the video API described, if this request streams it.
+
+    Only the output owner encodes: the API would encode exactly the frames
+    that rank returns. The frame rate is the one the API encodes at -- a
+    requested rate, else the model's. A stream that cannot start leaves the
+    request on the raw-frame path.
+    """
+    spec = resolve_stream_mp4_request(getattr(sampling_params, "extra_args", None))
+    if (
+        spec is None
+        or getattr(sampling_params, "enable_frame_interpolation", False)
+        or not MiniMaxH3Pipeline._is_output_owner_rank()
+    ):
+        return None
+    try:
+        return MiniMaxH3ResponseMP4Stream(
+            spec,
+            height=height,
+            width=width,
+            fps=spec.get("fps") or MINIMAX_H3_FPS,
+            audio_channels=MINIMAX_H3_AUDIO_CHANNELS,
+            audio_sample_rate=MINIMAX_H3_AUDIO_SAMPLE_RATE,
+            device=pipeline.device,
+        )
+    except Exception:
+        logger.warning("MiniMax-H3 response MP4 streaming could not start; returning raw frames", exc_info=True)
+        return None
 
 
 def _register_dlo_component_cache(cache: BoundedAllocatorCache, *components: Any) -> None:
@@ -4480,13 +4519,40 @@ class MiniMaxH3Pipeline(
                 )
                 audios.append(None)
             else:
-                with h3_range("h3.decode"):
-                    video, audio = self.decode(
-                        video_latent,
-                        audio_latent,
-                        height=height,
-                        width=width,
-                    )
+                # A single, untrimmed output is exactly what the API encodes.
+                stream = (
+                    _start_response_mp4_stream(self, request.sampling_params, height=height, width=width)
+                    if num_outputs == 1 and trim is None
+                    else None
+                )
+                with h3_range("h3.decode"), publish_decoded_frames(stream):
+                    try:
+                        video, audio = self.decode(
+                            video_latent,
+                            audio_latent,
+                            height=height,
+                            width=width,
+                        )
+                    except BaseException:
+                        if stream is not None:
+                            stream.abort()
+                        raise
+                if stream is not None:
+                    with h3_range("h3.post.stream_mp4"):
+                        streaming = stream.close(video, audio)
+                    if streaming:
+                        # The encoder muxes the audio track meanwhile; the frames
+                        # stay referenced until the MP4 exists, for the fallback.
+                        with h3_range("h3.post.release_stage_cache"):
+                            self._release_stage_cache()
+                        with h3_range("h3.post.stream_mp4.wait"):
+                            encoded = stream.result()
+                        if encoded is not None:
+                            videos.append(encoded[0])
+                            frame_counts.append(encoded[1])
+                            audios.append(None)
+                            del video, audio
+                            continue
                 if trim is not None:
                     # Decode keeps the real tail as causal context; return only new frames.
                     video, audio = trim_decoded_overlap(video, audio, **trim)

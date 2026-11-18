@@ -24,12 +24,18 @@ when the checkpoint tiles in parallel (``vae_global_tiles``; roll back with
 ``VLLM_OMNI_H3_VAE_GLOBAL_TILES=0``).
 
 Set ``VLLM_OMNI_VAE_LEGACY_TEMPORAL=1`` to keep the checkpoint's methods.
+
+While ``publish_decoded_frames`` is active, the streaming decode fork also
+hands each range of frames to a sink as soon as their final values land in
+the ``uint8`` buffer, so a consumer can start on them before the decode ends.
 """
 
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
 from types import MethodType
 
@@ -42,6 +48,28 @@ from .vae_global_tiles import global_tile_state, global_tiled_decode, global_til
 logger = init_logger(__name__)
 
 _LEGACY_TEMPORAL_ENV = "VLLM_OMNI_VAE_LEGACY_TEMPORAL"
+
+# ``sink(dec, start, end)``: ``dec[:, :, start:end]`` has just received its final values.
+DecodedFrameSink = Callable[[torch.Tensor, int, int], None]
+_DECODED_FRAME_SINK: ContextVar[DecodedFrameSink | None] = ContextVar("minimax_h3_decoded_frame_sink", default=None)
+
+
+@contextmanager
+def publish_decoded_frames(sink: DecodedFrameSink | None) -> Iterator[None]:
+    """Hand finished frames of the streaming ``uint8`` decode to ``sink`` in this scope.
+
+    The fork writes frames strictly in order and never revisits one, so each
+    ``(dec, start, end)`` call names frames that are final; ``dec`` is the
+    buffer the decode returns. The sink runs on the decoding thread inside the
+    VAE's (possibly distributed) temporal loop and must not raise: a rank that
+    left the loop early would hang its peers in the next collective. ``None``
+    publishes nothing, and decodes that do not run the fork never call it.
+    """
+    token = _DECODED_FRAME_SINK.set(sink)
+    try:
+        yield
+    finally:
+        _DECODED_FRAME_SINK.reset(token)
 
 
 def _legacy_temporal_enabled() -> bool:
@@ -169,6 +197,7 @@ def _decode_temporal_streaming_uint8(
 
     chunk_dec = self.tokens_chunk_size * self.vae_ratio_t
     split_count = int(self.token_drop > 0) + 1
+    sink = _DECODED_FRAME_SINK.get()
     dec = None
     dec_overlap = None
     norm = None
@@ -214,6 +243,9 @@ def _decode_temporal_streaming_uint8(
             if copy_frames > 0:
                 dec[:, :, write_pos : write_pos + copy_frames, :, :].copy_(part[:, :, :copy_frames, :, :])
                 write_pos += copy_frames
+                if sink is not None:
+                    with h3_range("h3.vae_video.publish_frames"):
+                        sink(dec, write_pos - copy_frames, write_pos)
             dropped_frames += part_frames - copy_frames
 
     def clip_latent(i):
@@ -337,4 +369,4 @@ def install_temporal_stream_patches(
         logger.warning("MiniMax-H3 VAE streaming decode contract not found; keeping checkpoint method")
 
 
-__all__ = ["install_temporal_stream_patches"]
+__all__ = ["DecodedFrameSink", "install_temporal_stream_patches", "publish_decoded_frames"]

@@ -4477,3 +4477,61 @@ def test_video_routes_inherit_engine_defaults(test_client, mocker: MockerFixture
         assert params.extra_args["stage_default"] == "keep"
         params.extra_args["stage_default"] = "mutated"
     assert defaults.extra_args == {"stage_default": "keep"}
+
+
+@pytest.mark.parametrize("response", ["bytes", "base64"])
+@pytest.mark.parametrize(
+    ("fields", "expected_fps"),
+    [({}, None), ({"fps": 30}, 30)],
+    ids=["model-fps", "requested-fps"],
+)
+def test_encoding_video_requests_describe_their_response_mp4(mocker: MockerFixture, response, fields, expected_fps):
+    """A pipeline can only encode the MP4 the API would have encoded if it is told how."""
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"encoded-video")
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video.encode_video_base64", return_value="encoded-video")
+    # A client cannot forge the description: the handler owns the key.
+    forged = {video_api_utils.STREAMING_RESPONSE_ENCODING_KEY: {"frame_path": "borrowed_rgb", "affinity_cpus": 0}}
+    request = VideoGenerationRequest(prompt="test prompt", extra_params=forged, **fields)
+    try:
+        generate = handler.generate_video_bytes if response == "bytes" else handler.generate_videos
+        asyncio.run(generate(request, "describe-encoding"))
+    finally:
+        handler.shutdown()
+
+    spec = engine.captured_sampling_params_list[0].extra_args[video_api_utils.STREAMING_RESPONSE_ENCODING_KEY]
+    assert spec == {
+        "frame_path": "direct_planar",
+        "video_codec_options": {"preset": "ultrafast", "threads": "0"},
+        "affinity_cpus": video_api_utils.usable_cpu_count(),
+        "fps": expected_fps,
+    }
+
+
+def test_response_mp4_description_follows_codec_options_and_borrowed_frames(mocker: MockerFixture):
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    mocker.patch("vllm_omni.entrypoints.openai.serving_video._encode_video_bytes", return_value=b"encoded-video")
+    mocker.patch.object(handler, "_video_encoding_options", return_value={"enable_borrowed_frames": True})
+    request = VideoGenerationRequest(prompt="test prompt", extra_params={"video_codec_options": {"preset": "fast"}})
+    try:
+        asyncio.run(handler.generate_video_bytes(request, "describe-options"))
+    finally:
+        handler.shutdown()
+
+    spec = engine.captured_sampling_params_list[0].extra_args[video_api_utils.STREAMING_RESPONSE_ENCODING_KEY]
+    assert spec["frame_path"] == "borrowed_rgb"
+    assert spec["video_codec_options"] == {"preset": "fast"}
+
+
+def test_requests_that_are_not_encoded_carry_no_response_mp4_description():
+    engine = FakeAsyncOmni()
+    handler = OmniOpenAIServingVideo.for_diffusion(engine, model_name="test-model")
+    forged = {video_api_utils.STREAMING_RESPONSE_ENCODING_KEY: {"frame_path": "direct_planar"}}
+    try:
+        asyncio.run(handler._run_and_extract(VideoGenerationRequest(prompt="p", extra_params=forged), "frames"))
+    finally:
+        handler.shutdown()
+
+    assert video_api_utils.STREAMING_RESPONSE_ENCODING_KEY not in engine.captured_sampling_params_list[0].extra_args

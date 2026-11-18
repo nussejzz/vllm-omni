@@ -35,9 +35,12 @@ from vllm_omni.entrypoints.openai.stage_params import (
 )
 from vllm_omni.entrypoints.openai.utils import get_stage_type, is_video_generation_pipeline, parse_lora_requests
 from vllm_omni.entrypoints.openai.video_api_utils import (
+    STREAMING_RESPONSE_ENCODING_KEY,
     _encode_video_bytes,
     _PlanarFrameConverter,
     encode_video_base64,
+    streaming_response_frame_path,
+    usable_cpu_count,
 )
 from vllm_omni.inputs.data import (
     OmniDiffusionSamplingParams,
@@ -219,6 +222,30 @@ class OmniOpenAIServingVideo:
             return {"enable_borrowed_frames": True}
         return {}
 
+    def _streaming_response_encoding(
+        self,
+        video_codec_options: Any,
+        encoding_options: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Describe how this handler will encode the response MP4, before generation.
+
+        A pipeline that can produce that exact MP4 while it still decodes
+        returns the bytes instead of frames; anything else ignores it.
+        ``affinity_cpus`` is taken on this thread, where the encoder runs:
+        libx264 sizes its threads, and so its slices, from it.
+        """
+        frame_path = streaming_response_frame_path(
+            frame_converter=self._video_frame_converter,
+            enable_borrowed_frames=encoding_options.get("enable_borrowed_frames") is True,
+        )
+        if frame_path is None:
+            return None
+        return {
+            "frame_path": frame_path,
+            "video_codec_options": video_codec_options,
+            "affinity_cpus": usable_cpu_count(),
+        }
+
     def _resolve_video_generation_defaults(
         self,
         request: VideoGenerationRequest,
@@ -376,8 +403,14 @@ class OmniOpenAIServingVideo:
         reference_audio: ReferenceAudio | None = None,
         on_started: Callable[[], Awaitable[None]] | None = None,
         latent_edit_input: LatentEditInput | None = None,
+        response_encoding: Mapping[str, Any] | None = None,
     ) -> VideoGenerationArtifacts:
-        """Run the generation pipeline and extract video/audio/profiler outputs."""
+        """Run the generation pipeline and extract video/audio/profiler outputs.
+
+        ``response_encoding`` describes the MP4 the caller will encode from the
+        frames (see ``_streaming_response_encoding``); the requested frame
+        rate, the one the caller encodes at, is added here.
+        """
         if request.streaming_buffer_seconds is not None:
             raise HTTPException(
                 status_code=HTTPStatus.BAD_REQUEST.value,
@@ -579,6 +612,13 @@ class OmniOpenAIServingVideo:
             if redacted:
                 loggable = {**loggable, **redacted}
             logger.info("Applied extra_params: %s", loggable)
+        # Server-owned: only this handler knows how it will encode the frames.
+        gen_params.extra_args.pop(STREAMING_RESPONSE_ENCODING_KEY, None)
+        if response_encoding is not None:
+            gen_params.extra_args[STREAMING_RESPONSE_ENCODING_KEY] = {
+                **response_encoding,
+                "fps": vp.fps if fps_provided else None,
+            }
 
         if self.supports_latent_continuation and (request.extra_params or {}).get("regenerate") is not True:
             # Server-owned: the job id is the only key a later continue_from can name.
@@ -640,6 +680,12 @@ class OmniOpenAIServingVideo:
         reference_audio: ReferenceAudio | None = None,
         latent_edit_input: LatentEditInput | None = None,
     ) -> VideoGenerationResponse:
+        video_codec_options = {"preset": "ultrafast", "threads": "0"}
+        if request.extra_params is not None and isinstance(request.extra_params, dict):
+            if "video_codec_options" in request.extra_params:
+                video_codec_options = request.extra_params["video_codec_options"]
+
+        encoding_options = self._video_encoding_options()
         artifacts = await self._run_and_extract(
             request,
             reference_id,
@@ -647,14 +693,8 @@ class OmniOpenAIServingVideo:
             reference_video=reference_video,
             reference_audio=reference_audio,
             latent_edit_input=latent_edit_input,
+            response_encoding=self._streaming_response_encoding(video_codec_options, encoding_options),
         )
-
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
-        if request.extra_params is not None and isinstance(request.extra_params, dict):
-            if "video_codec_options" in request.extra_params:
-                video_codec_options = request.extra_params["video_codec_options"]
-
-        encoding_options = self._video_encoding_options()
 
         def encode_video_result(idx: int, video: Any) -> str:
             if isinstance(video, bytes):
@@ -698,6 +738,12 @@ class OmniOpenAIServingVideo:
         latent_edit_input: LatentEditInput | None = None,
     ) -> tuple[bytes, dict[str, float], float, VideoAction | None, dict[str, object]]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
+        video_codec_options = {"preset": "ultrafast", "threads": "0"}
+        if request.extra_params is not None and isinstance(request.extra_params, dict):
+            if "video_codec_options" in request.extra_params:
+                video_codec_options = request.extra_params["video_codec_options"]
+
+        encoding_options: dict[str, Any] = self._video_encoding_options()
         artifacts = await self._run_and_extract(
             request,
             reference_id,
@@ -706,6 +752,7 @@ class OmniOpenAIServingVideo:
             reference_audio=reference_audio,
             on_started=on_started,
             latent_edit_input=latent_edit_input,
+            response_encoding=self._streaming_response_encoding(video_codec_options, encoding_options),
         )
         if len(artifacts.videos) > 1:
             logger.warning(
@@ -715,18 +762,12 @@ class OmniOpenAIServingVideo:
             )
         audio = artifacts.audios[0]
 
-        video_codec_options = {"preset": "ultrafast", "threads": "0"}
-        if request.extra_params is not None and isinstance(request.extra_params, dict):
-            if "video_codec_options" in request.extra_params:
-                video_codec_options = request.extra_params["video_codec_options"]
-
         action = artifacts.actions[0]
         video_metadata = _video_metadata_from_artifacts(artifacts)
         if action is not None and isinstance(artifacts.videos[0], dict):
             logger.info("Action-only video request %s completed; skipping MP4 encoding.", reference_id)
             return b"", artifacts.stage_durations, artifacts.peak_memory_mb, action, video_metadata
 
-        encoding_options: dict[str, Any] = self._video_encoding_options()
         if audio is not None:
             encoding_options.update(audio=audio, audio_sample_rate=artifacts.audio_sample_rate)
         _t_encode_start = time.perf_counter()

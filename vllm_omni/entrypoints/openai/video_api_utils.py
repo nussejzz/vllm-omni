@@ -28,14 +28,16 @@ from __future__ import annotations
 import base64
 import binascii
 import os
+import queue
 import tempfile
 import threading
 from collections import deque
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
+from fractions import Fraction
 from io import BytesIO
 from numbers import Integral
-from typing import TYPE_CHECKING, Any, Literal, TypeAlias
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeAlias, cast
 
 import httpx
 import numpy as np
@@ -993,6 +995,336 @@ def _encode_video_bytes(
         video_frames.close()
         if owns_frame_converter:
             converter.shutdown()
+
+
+# Extra-args key through which the video API describes, before generation, the
+# MP4 it will encode from a request's frames, so a pipeline can encode the
+# identical file while its VAE still decodes (MiniMax-H3: VLLM_OMNI_H3_STREAM_MP4).
+STREAMING_RESPONSE_ENCODING_KEY = "streaming_response_encoding"
+STREAMING_RESPONSE_FRAME_PATHS = ("direct_planar", "borrowed_rgb")
+
+
+def usable_cpu_count() -> int:
+    """CPUs the calling thread may run on; libx264's automatic thread count derives from it."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # sched_getaffinity is Linux-only.
+        return os.cpu_count() or 1
+
+
+def streaming_response_frame_path(
+    *,
+    frame_converter: _PlanarFrameConverter | None,
+    enable_borrowed_frames: bool,
+) -> str | None:
+    """Name the route :func:`_encode_video_bytes` takes for uint8 ``(T, H, W, 3)`` frames.
+
+    Contiguous uint8 RGB frames take ``borrowed_rgb`` when borrowed frames are
+    enabled, else ``direct_planar`` when the converter may read interleaved
+    channels (more than one worker). The remaining route, ``legacy_fallback``,
+    has no streaming counterpart, so it is reported as ``None``.
+    """
+    if enable_borrowed_frames:
+        return "borrowed_rgb"
+    if frame_converter is not None and frame_converter.max_workers > 1:
+        return "direct_planar"
+    return None
+
+
+_STREAMING_VIDEO_DONE = object()
+
+
+class _StreamingVideoChunk(NamedTuple):
+    """One queued chunk: its frames (or a call that blocks until they land) and its release."""
+
+    frames: np.ndarray | Callable[[], np.ndarray]
+    on_consumed: Callable[[], None] | None
+
+
+def _release_streaming_chunk(on_consumed: Callable[[], None] | None) -> None:
+    if on_consumed is None:
+        return
+    try:
+        on_consumed()
+    except BaseException:  # noqa: BLE001
+        logger.exception("Streaming MP4 encoder failed to release a consumed chunk")
+
+
+def _audio_layout(channels: int) -> str:
+    # The layout rule of ``mux_av_video_audio_bytes``.
+    return "stereo" if channels >= 2 else "mono"
+
+
+def _prepare_streaming_audio_samples(audio: Any) -> np.ndarray:
+    """The ``(C, N)`` float32 samples ``mux_av_video_audio_bytes`` builds from ``audio``."""
+    samples = _coerce_audio_to_numpy(audio).astype(np.float32)
+    if samples.ndim == 1:
+        samples = samples.reshape(1, -1)
+    elif samples.ndim == 2 and samples.shape[0] > samples.shape[1]:
+        samples = np.ascontiguousarray(samples.T)
+    return samples
+
+
+class StreamingVideoBytesEncoder:
+    """Encode a response MP4 from uint8 RGB chunks while their producer still decodes.
+
+    The streaming counterpart of :func:`_encode_video_bytes` for uint8
+    ``(T, H, W, 3)`` frames, byte for byte: the same frame route
+    (``direct_planar`` GBR frames from :class:`_PlanarFrameConverter`, or
+    ``borrowed_rgb``), the stream setup and options of
+    ``mux_av_video_audio_bytes`` (H.264 ``yuv420p``, ``crf=18`` updated by
+    ``video_codec_options``, AAC), and its encode order: every frame and the
+    video flush come before the audio track is encoded. That order is what
+    lets the waveform arrive after the last frame, at :meth:`finish`. Its
+    channel count must be declared up front, because the container header,
+    audio track included, is written with the first video packet.
+
+    One muxing thread consumes chunks in push order. ``max_pending`` bounds
+    queued chunks; a chunk given as a callable is resolved on that thread, so
+    a pending device-to-host copy does not stall the producer. ``on_consumed``
+    fires once the chunk's frames were handed to the encoder, including when
+    the chunk is discarded by a failure or :meth:`abort`.
+    """
+
+    def __init__(
+        self,
+        *,
+        width: int,
+        height: int,
+        fps: int | float,
+        frame_path: str = "direct_planar",
+        audio_channels: int | None = None,
+        audio_sample_rate: int | None = None,
+        video_codec_options: Mapping[str, Any] | None = None,
+        frame_conversion_workers: int = 1,
+        max_pending: int = 2,
+    ) -> None:
+        if width <= 0 or height <= 0:
+            raise ValueError("width and height must be positive")
+        if frame_path not in STREAMING_RESPONSE_FRAME_PATHS:
+            raise ValueError(f"unsupported streaming frame path {frame_path!r}")
+        if audio_channels is not None and audio_channels <= 0:
+            raise ValueError("audio_channels must be positive")
+        if max_pending <= 0:
+            raise ValueError("max_pending must be positive")
+        self.width = int(width)
+        self.height = int(height)
+        self.frame_count = 0
+        self._fps = float(fps)
+        self._frame_path = frame_path
+        self._audio_channels = audio_channels
+        self._audio_sample_rate = (
+            _resolve_audio_sample_rate(None, audio_sample_rate) if audio_channels is not None else None
+        )
+        self._video_codec_options = video_codec_options
+        self._converter = (
+            _PlanarFrameConverter(max_workers=frame_conversion_workers) if frame_path == "direct_planar" else None
+        )
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=max_pending)
+        self._audio_ready = threading.Event()
+        self._audio_samples: np.ndarray | None = None
+        self._result: bytes | None = None
+        self._error: BaseException | None = None
+        self._input_done = False
+        self._closed = False
+        self._aborted = False
+        self._state_lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="streaming-mp4", daemon=True)
+        self._thread.start()
+
+    @property
+    def failed(self) -> bool:
+        return self._error is not None
+
+    def push(
+        self,
+        frames: np.ndarray | Callable[[], np.ndarray],
+        *,
+        on_consumed: Callable[[], None] | None = None,
+    ) -> None:
+        """Queue the next frames; ownership of ``on_consumed`` transfers on call."""
+        try:
+            self._raise_if_failed()
+            if isinstance(frames, np.ndarray):
+                self._validate_chunk(frames)
+            elif not callable(frames):
+                raise TypeError("frames must be an array or a callable returning one")
+        except BaseException:
+            _release_streaming_chunk(on_consumed)
+            raise
+        self._queue.put(_StreamingVideoChunk(frames, on_consumed))
+
+    def finish(self, audio: Any | None = None) -> bytes:
+        """Encode ``audio`` after the last frame and return the complete MP4 bytes."""
+        self.close(audio)
+        return self.result()
+
+    def close(self, audio: Any | None = None) -> None:
+        """End the video and hand over ``audio`` without waiting for the muxing thread."""
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("StreamingVideoBytesEncoder is already closed")
+            self._closed = True
+        try:
+            if (audio is None) != (self._audio_channels is None):
+                raise ValueError("audio must be given exactly when audio_channels was declared")
+            if audio is not None:
+                samples = _prepare_streaming_audio_samples(audio)
+                if samples.ndim != 2 or _audio_layout(samples.shape[0]) != _audio_layout(self._audio_channels):
+                    raise ValueError(
+                        f"audio shape {tuple(samples.shape)} does not match the declared "
+                        f"{self._audio_channels}-channel track"
+                    )
+                self._audio_samples = samples
+        except BaseException:
+            self._abort_locked()
+            raise
+        self._audio_ready.set()
+        self._queue.put(_STREAMING_VIDEO_DONE)
+
+    def result(self) -> bytes:
+        """Wait for the muxing thread after :meth:`close` and return the complete MP4 bytes."""
+        if not self._closed:
+            raise RuntimeError("close() the StreamingVideoBytesEncoder before waiting for its result")
+        self._thread.join()
+        self._shutdown_converter()
+        if self._error is not None:
+            raise self._error
+        assert self._result is not None
+        return self._result
+
+    def abort(self) -> None:
+        """Discard queued chunks and join the muxing thread."""
+        with self._state_lock:
+            if self._closed:
+                if self._thread.is_alive():
+                    self._thread.join()
+                return
+            self._closed = True
+        self._abort_locked()
+
+    def _abort_locked(self) -> None:
+        self._aborted = True
+        while True:
+            try:
+                entry = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if entry is not _STREAMING_VIDEO_DONE:
+                _release_streaming_chunk(cast(_StreamingVideoChunk, entry).on_consumed)
+        self._audio_ready.set()
+        self._queue.put(_STREAMING_VIDEO_DONE)
+        self._thread.join()
+        self._shutdown_converter()
+
+    def _shutdown_converter(self) -> None:
+        if self._converter is not None:
+            self._converter.shutdown()
+
+    def _raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise self._error
+        if self._closed:
+            raise RuntimeError("StreamingVideoBytesEncoder is already closed")
+
+    def _validate_chunk(self, chunk: np.ndarray) -> None:
+        if chunk.ndim != 4 or chunk.shape[-1] != 3 or chunk.dtype != np.uint8:
+            raise ValueError("streamed video chunks must be uint8 arrays shaped (T, H, W, 3)")
+        if chunk.shape[1] != self.height or chunk.shape[2] != self.width:
+            raise ValueError("streamed video chunks must keep the declared frame size")
+        if chunk.strides[1:] != (self.width * 3, 3, 1):
+            raise ValueError("streamed video chunks must hold contiguous RGB rows")
+
+    def _run(self) -> None:
+        frames = self._frames()
+        try:
+            self._result = self._mux(frames)
+        except BaseException as exc:  # noqa: BLE001
+            self._error = exc
+            frames.close()
+            self._drain_until_done()
+
+    def _drain_until_done(self) -> None:
+        if self._input_done:
+            return
+        while True:
+            entry = self._queue.get()
+            if entry is _STREAMING_VIDEO_DONE:
+                self._input_done = True
+                return
+            _release_streaming_chunk(cast(_StreamingVideoChunk, entry).on_consumed)
+
+    def _frames(self) -> Generator[av.VideoFrame, None, None]:
+        import av
+
+        while True:
+            entry = self._queue.get()
+            if entry is _STREAMING_VIDEO_DONE:
+                self._input_done = True
+                return
+            assert isinstance(entry, _StreamingVideoChunk)
+            try:
+                if self._aborted:
+                    continue
+                chunk = entry.frames() if callable(entry.frames) else entry.frames
+                self._validate_chunk(chunk)
+                if self._converter is None:
+                    for frame in chunk:
+                        yield av.VideoFrame.from_numpy_buffer(frame, format="rgb24")
+                        self.frame_count += 1
+                else:
+                    for converted in self._converter.iter_frames(list(chunk), np.dtype(np.uint8)):
+                        yield converted
+                        self.frame_count += 1
+            finally:
+                _release_streaming_chunk(entry.on_consumed)
+
+    def _mux(self, frames: Generator[av.VideoFrame, None, None]) -> bytes:
+        """``mux_av_video_audio_bytes`` with the audio samples taken after the video flush."""
+        import av
+
+        buf = BytesIO()
+        with cast(Any, av.open(buf, mode="w", format="mp4")) as container:
+            v_stream = cast(
+                av.VideoStream, container.add_stream("h264", rate=Fraction(self._fps).limit_denominator(10000))
+            )
+            v_stream.width = self.width
+            v_stream.height = self.height
+            v_stream.pix_fmt = "yuv420p"
+            options: dict[str, object] = {"crf": "18"}
+            if self._video_codec_options:
+                options.update(self._video_codec_options)
+            v_stream.options = options
+
+            a_stream: av.AudioStream | None = None
+            if self._audio_channels is not None:
+                a_stream = cast(av.AudioStream, container.add_stream("aac", rate=self._audio_sample_rate))
+                a_stream.layout = _audio_layout(self._audio_channels)
+
+            for frame in frames:
+                for packet in v_stream.encode(frame):
+                    container.mux(packet)
+            for packet in v_stream.encode():
+                container.mux(packet)
+
+            self._audio_ready.wait()
+            if self._aborted:
+                raise RuntimeError("StreamingVideoBytesEncoder was aborted")
+            if a_stream is not None:
+                samples = self._audio_samples
+                assert samples is not None and self._audio_sample_rate is not None
+                audio_frame = av.AudioFrame.from_ndarray(samples, format="fltp", layout=_audio_layout(samples.shape[0]))
+                audio_frame.sample_rate = self._audio_sample_rate
+                # As in mux_av_video_audio_bytes: the waveform starts at t=0 so the
+                # muxer writes AAC's priming delay as a negative timestamp.
+                audio_frame.pts = 0
+                audio_frame.time_base = Fraction(1, self._audio_sample_rate)
+                for packet in a_stream.encode(audio_frame):
+                    container.mux(packet)
+                for packet in a_stream.encode():
+                    container.mux(packet)
+
+        return buf.getvalue()
 
 
 class FragmentedMP4VideoEncoder:

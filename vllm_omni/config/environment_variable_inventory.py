@@ -285,6 +285,9 @@ _MODEL_INTERNALIZE = (
     # MiniMax-H3: transitional rollback/A-B switch for the strict-Ulysses Q/K/O
     # permute trim (0 = permute copies before every all-to-all).
     "VLLM_OMNI_H3_ULYSSES_PERMUTE_TRIM",
+    # MiniMax-H3: transitional rollback/A-B switch for encoding the response
+    # MP4 during VAE decode (0 = return raw frames for the API to encode).
+    "VLLM_OMNI_H3_STREAM_MP4",
     # CI-only fallback for memory-constrained MOSS Realtime qualification.
     "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE",
     "VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR",
