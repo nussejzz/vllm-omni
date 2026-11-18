@@ -262,6 +262,9 @@ _MODEL_INTERNALIZE = (
     "MAGI2_ROUTER_BIAS_SOURCE",
     "NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE",
     "VLLM_OMNI_CODE2WAV_STATS",
+    # MiniMax-H3: transitional rollback/A-B switch for direct reference-video
+    # frame decoding (0 = lossless prepared.mp4 round trip).
+    "VLLM_OMNI_H3_REFERENCE_DECODE_WORKERS",
     # CI-only fallback for memory-constrained MOSS Realtime qualification.
     "VLLM_OMNI_MOSS_REALTIME_REF_ENCODER_DEVICE",
     "VLLM_OMNI_QWEN_VISUAL_DEBUG_DIR",
