@@ -26,6 +26,14 @@ change. It then binds the selected operator set, reuses Omni's existing
 dtype already selected by decode autocast. Unsupported model contracts, tensor
 inputs, execution modes, and devices retain the original implementation.
 
+The encoder installer (`install_h3_vae_encoder_fusion`; transitional switch
+`VLLM_OMNI_H3_VAE_ENCODER_FUSION`, `0` keeps the checkpoint forwards) validates
+and probes the checkpoint's 3D CNN encoder, then replaces only the layout, SiLU,
+and reflect/causal padding copies in front of each padded convolution with one
+exact kernel. GroupNorm, the convolutions, and the residual adds still run the
+checkpoint's operations. Its operator is registered for SM90 only, where
+full-encode and all-FP32-input SiLU evidence has been collected.
+
 Hardware dispatch is an explicit allowlist. SM90, SM100, and SM103 are enabled;
 other capabilities fall back to the reference path. Bit-exact full-decode and
 operator evidence has been collected on SM90, with independent full-decode and

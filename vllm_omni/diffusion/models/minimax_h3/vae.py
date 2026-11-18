@@ -34,7 +34,7 @@ from vllm_omni.diffusion.offloader.module_residency import (
 from vllm_omni.platforms import current_omni_platform
 
 from .chunked_decode import decode_h3_chunks
-from .ops import install_h3_vae_optimizations
+from .ops import install_h3_vae_encoder_fusion, install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
 from .profiling import h3_range
 from .vae_temporal import install_temporal_stream_patches
@@ -45,6 +45,10 @@ MINIMAX_H3_AUDIO_CHANNELS = 2
 
 # Escape hatch back to the checkpoint's whole-video numpy preparation path.
 _VAE_ENCODE_LEGACY_PREP_ENV = "VLLM_OMNI_VAE_ENCODE_LEGACY_PREP"
+# Transitional switch for the fused encoder input chain
+# (``ops/vae/encoder.py``): unset or 1 installs it where an exact operator is
+# registered, 0 keeps the checkpoint's encoder forwards.
+_VAE_ENCODER_FUSION_ENV = "VLLM_OMNI_H3_VAE_ENCODER_FUSION"
 
 
 logger = init_logger(__name__)
@@ -102,6 +106,13 @@ def _is_device_uint8_video(frames: Any) -> bool:
         and frames.ndim == 4
         and frames.shape[-1] == 3
     )
+
+
+def _encoder_fusion_enabled() -> bool:
+    value = os.environ.get(_VAE_ENCODER_FUSION_ENV, "").strip() or "1"
+    if value not in ("0", "1"):
+        raise ValueError(f"{_VAE_ENCODER_FUSION_ENV} must be 0 or 1, got {value!r}")
+    return value == "1"
 
 
 def _load_component_config(component_path: str) -> dict[str, Any]:
@@ -473,6 +484,12 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                 device=device,
             )
         install_temporal_stream_patches(self.remote.model, pixel_transform=self._pixel_transform)
+        encoder = getattr(self.remote.model, "encoder", None)
+        if encoder is not None:
+            if not _encoder_fusion_enabled():
+                logger.info("MiniMax-H3 VAE encoder fusion disabled by %s=0", _VAE_ENCODER_FUSION_ENV)
+            elif install_h3_vae_encoder_fusion(encoder, device=device):
+                logger.info("MiniMax-H3 VAE encoder fusion installed")
         # The three decoder fast paths below are XPU-only: they were written
         # against the XPU kernels/compile stack and validated there. CUDA keeps
         # its own fused-operator path (install_h3_vae_optimizations above); on
