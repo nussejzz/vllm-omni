@@ -15,6 +15,7 @@ from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_
 from vllm_omni.diffusion.sampler import ModelEvaluation, SamplingState
 
 from .latent_mask import MiniMaxH3LatentEdit
+from .profiling import h3_range
 from .scheduling_minimax_h3_euler_ancestral import minimax_h3_rf_v_to_x0
 
 if TYPE_CHECKING:
@@ -187,13 +188,15 @@ class MiniMaxH3ModelBatch:
 
         if not evaluations:
             return []
-        check_request_cancellation()
+        with h3_range(f"h3.nfe_prep.cancel_check.{evaluations[0].state.step_index}"):
+            check_request_cancellation()
         models = [self.models[e.state] for e in evaluations]
         request_progress = [(e.state.step_index, e.sigmas[0], len(e.state.sigmas[0]) - 1) for e in evaluations]
         uniform_progress = len(set(request_progress)) == 1
         # Requests at different points have nothing common to publish, so
         # step-gated attention stays dense, its safe default.
-        minimax_h3_publish_denoise_progress(*(request_progress[0] if uniform_progress else (None, None, None)))
+        with h3_range(f"h3.nfe_prep.publish_progress.{evaluations[0].state.step_index}"):
+            minimax_h3_publish_denoise_progress(*(request_progress[0] if uniform_progress else (None, None, None)))
         context = get_forward_context() if is_forward_context_available() else None
         try:
             pdd = getattr(getattr(models[0].transformer, "arch", None), "pdd_steps", None) is not None
@@ -206,19 +209,21 @@ class MiniMaxH3ModelBatch:
                     level, message = reason
                     level(message + " Running %d requests one forward at a time.", len(models))
                     return [self([e])[0] for e in evaluations]
-            prepared = [m.prepare(e) for m, e in zip(models, evaluations, strict=True)]
+            with h3_range(f"h3.nfe_prep.rows.{evaluations[0].state.step_index}"):
+                prepared = [m.prepare(e) for m, e in zip(models, evaluations, strict=True)]
             if len(models) == 1:
                 _, rows, times, cond = prepared[0]
-                kwargs = models[0].branch.forward_kwargs(
-                    video_rows=rows[0][0],
-                    audio_rows=rows[1][0],
-                    t_video=times[0],
-                    t_audio=times[1],
-                    imgvid_cond_timestep=cond[0],
-                    audio_ref_cond_timestep=cond[1],
-                    video_target_timesteps=rows[0][1],
-                    audio_target_timesteps=rows[1][1],
-                )
+                with h3_range(f"h3.nfe_prep.kwargs.{evaluations[0].state.step_index}"):
+                    kwargs = models[0].branch.forward_kwargs(
+                        video_rows=rows[0][0],
+                        audio_rows=rows[1][0],
+                        t_video=times[0],
+                        t_audio=times[1],
+                        imgvid_cond_timestep=cond[0],
+                        audio_ref_cond_timestep=cond[1],
+                        video_target_timesteps=rows[0][1],
+                        audio_target_timesteps=rows[1][1],
+                    )
             else:
                 kwargs = minimax_h3_batched_forward_kwargs(
                     branches=[m.branch for m in models],
@@ -236,14 +241,17 @@ class MiniMaxH3ModelBatch:
             reference_kv_state = kwargs.get("reference_kv_state")
             if reference_kv_state is not None:
                 reference_kv_state.begin_step(evaluations[0].state.step_index, sigma=float(evaluations[0].sigmas[0]))
-            video, audio = models[0].transformer(**kwargs)
+            with h3_range(f"h3.nfe.{evaluations[0].state.step_index}"):
+                video, audio = models[0].transformer(**kwargs)
             if reference_kv_state is not None:
                 reference_kv_state.end_step()
-            check_request_cancellation()
-            video_parts = video.split([m.rows[0].shape[0] for m in models])
-            audio_parts = audio.split([m.rows[1].shape[0] for m in models])
-            return [
-                m.to_denoised(p, (v, a)) for m, p, v, a in zip(models, prepared, video_parts, audio_parts, strict=True)
-            ]
+            with h3_range(f"h3.nfe_post.x0.{evaluations[0].state.step_index}"):
+                check_request_cancellation()
+                video_parts = video.split([m.rows[0].shape[0] for m in models])
+                audio_parts = audio.split([m.rows[1].shape[0] for m in models])
+                return [
+                    m.to_denoised(p, (v, a))
+                    for m, p, v, a in zip(models, prepared, video_parts, audio_parts, strict=True)
+                ]
         finally:
             minimax_h3_publish_denoise_progress(None, None, None)

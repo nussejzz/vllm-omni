@@ -57,6 +57,7 @@ from .minimax_h3_blocks import (
     _norm,
     _ring_sequence_parallel_is_active,
 )
+from .profiling import h3_dit_range
 from .vdnh3 import VDNConfig
 
 if TYPE_CHECKING:
@@ -1479,16 +1480,17 @@ class MiniMaxH3DiTModel(nn.Module):
                 device=device,
             )
         elif rope_table is None:
-            if current_omni_platform.is_npu():
-                rope_table = self.prepare_rope_table(
-                    img_position_ids,
-                    seq_len=seq_len,
-                )
-            else:
-                # Keep CUDA/CPU numerically and structurally identical to the
-                # main-branch reference path used by the H100 accuracy suite.
-                rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
-                rope_table = _build_rope_table(self.rope(rope_position_ids).to(device))
+            with h3_dit_range("h3.dit.rope_table"):
+                if current_omni_platform.is_npu():
+                    rope_table = self.prepare_rope_table(
+                        img_position_ids,
+                        seq_len=seq_len,
+                    )
+                else:
+                    # Keep CUDA/CPU numerically and structurally identical to the
+                    # main-branch reference path used by the H100 accuracy suite.
+                    rope_position_ids = img_position_ids.narrow(1, local_start, local_len)
+                    rope_table = _build_rope_table(self.rope(rope_position_ids).to(device))
         else:
             self._validate_prepared_rope_table(
                 rope_table,
@@ -1496,22 +1498,23 @@ class MiniMaxH3DiTModel(nn.Module):
                 device=device,
             )
 
-        decoder_input, t_emb = self._embed(
-            x=x,
-            audio_x=audio_x,
-            text_embeddings_selected=text_selected,
-            unique_timesteps=unique_timesteps.view(-1).to(device),
-            img_pos=img_pos.to(device),
-            audio_pos=audio_pos.to(device),
-            text_pos=text_pos.to(device),
-            refiner_cu_seqlens=refiner_cu.to(device),
-            refiner_max_seqlen=refiner_max,
-            num_requests=num_requests,
-            seq_len=seq_len,
-            device=device,
-            local_span=local_span,
-            global_positions=(compact_local_positions if compact_reference and local_len != seq_len else None),
-        )
+        with h3_dit_range("h3.dit.embed"):
+            decoder_input, t_emb = self._embed(
+                x=x,
+                audio_x=audio_x,
+                text_embeddings_selected=text_selected,
+                unique_timesteps=unique_timesteps.view(-1).to(device),
+                img_pos=img_pos.to(device),
+                audio_pos=audio_pos.to(device),
+                text_pos=text_pos.to(device),
+                refiner_cu_seqlens=refiner_cu.to(device),
+                refiner_max_seqlen=refiner_max,
+                num_requests=num_requests,
+                seq_len=seq_len,
+                device=device,
+                local_span=local_span,
+                global_positions=(compact_local_positions if compact_reference and local_len != seq_len else None),
+            )
 
         combined_indices = (inverse_indices * MINIMAX_H3_ADALN_MODALITY_NUM + token_tags.clamp(min=0)).to(device)
         inverse_indices = inverse_indices.to(device)
@@ -1549,12 +1552,13 @@ class MiniMaxH3DiTModel(nn.Module):
                 block_combined = block_combined.index_select(0, active_positions)
                 hidden, block_rope, block_combined = self.local_sp_prepare(hidden, block_rope, block_combined)
         else:
-            if local_len == seq_len:
-                hidden, block_rope, block_combined = self.sp_prepare(hidden, block_rope, block_combined)
-            else:
-                hidden, block_rope, block_combined = self.local_sp_prepare(hidden, block_rope, block_combined)
-            if reference_kv_state is not None:
-                reference_kv_state.set_local_sequence_rows(hidden.shape[0])
+            with h3_dit_range("h3.dit.sp_prepare"):
+                if local_len == seq_len:
+                    hidden, block_rope, block_combined = self.sp_prepare(hidden, block_rope, block_combined)
+                else:
+                    hidden, block_rope, block_combined = self.local_sp_prepare(hidden, block_rope, block_combined)
+                if reference_kv_state is not None:
+                    reference_kv_state.set_local_sequence_rows(hidden.shape[0])
 
         block_video_layout = video_layout
         if compact_reference:
@@ -1602,26 +1606,29 @@ class MiniMaxH3DiTModel(nn.Module):
                 num_requests=num_requests,
             )
         if getattr(self, "adaln_cache", None) is not None:
-            self.adaln_cache.prepare(t_emb)
+            with h3_dit_range("h3.dit.adaln_cache_prepare"):
+                self.adaln_cache.prepare(t_emb)
 
-        for block_index, block in enumerate(self.blocks):
-            hidden = block(
-                hidden,
-                t_emb=t_emb,
-                combined_indices=block_combined,
-                rope_table=block_rope,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=block_max_seqlen,
-                packed_total=block_packed_total,
-                num_requests=num_requests,
-                video_layout=block_video_layout,
-                vsa_prefix_segments=(() if compact_reference else vsa_prefix_segments),
-                reference_kv_state=reference_kv_state,
-                reference_kv_compact=compact_reference,
-                vdn_window=vdn_window,
-            )
-            if block_index in hints:
-                hidden = hidden + hints.pop(block_index) * control_scale
+        with h3_dit_range("h3.dit.blocks"):
+            for block_index, block in enumerate(self.blocks):
+                with h3_dit_range(f"h3.dit.block.{block_index}", 2):
+                    hidden = block(
+                        hidden,
+                        t_emb=t_emb,
+                        combined_indices=block_combined,
+                        rope_table=block_rope,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=block_max_seqlen,
+                        packed_total=block_packed_total,
+                        num_requests=num_requests,
+                        video_layout=block_video_layout,
+                        vsa_prefix_segments=(() if compact_reference else vsa_prefix_segments),
+                        reference_kv_state=reference_kv_state,
+                        reference_kv_compact=compact_reference,
+                        vdn_window=vdn_window,
+                    )
+                if block_index in hints:
+                    hidden = hidden + hints.pop(block_index) * control_scale
         if local_len == seq_len:
             hidden = self.sp_gather(hidden)
             final_inverse_indices = (
@@ -1660,38 +1667,40 @@ class MiniMaxH3DiTModel(nn.Module):
             video_logits.index_copy_(0, active_positions, compact_video)
             audio_logits.index_copy_(0, active_positions, compact_audio)
         else:
-            local_inverse_indices = inverse_indices.narrow(
-                0,
-                local_start,
-                local_len,
-            )
-            video_logits, audio_logits = self.final_layer(
-                hidden,
-                t_emb=t_emb,
-                inverse_indices=local_inverse_indices,
-                pdd_step=pdd_step,
-            )
-            compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
-            compact_logits = self.sp_gather(compact_logits)
-            video_width = self.arch.latents_dim * math.prod(self.arch.patch_size)
-            video_logits = compact_logits[..., :video_width]
-            audio_logits = compact_logits[..., video_width:]
+            with h3_dit_range("h3.dit.final_layer_gather"):
+                local_inverse_indices = inverse_indices.narrow(
+                    0,
+                    local_start,
+                    local_len,
+                )
+                video_logits, audio_logits = self.final_layer(
+                    hidden,
+                    t_emb=t_emb,
+                    inverse_indices=local_inverse_indices,
+                    pdd_step=pdd_step,
+                )
+                compact_logits = torch.cat((video_logits, audio_logits), dim=-1)
+                compact_logits = self.sp_gather(compact_logits)
+                video_width = self.arch.latents_dim * math.prod(self.arch.patch_size)
+                video_logits = compact_logits[..., :video_width]
+                audio_logits = compact_logits[..., video_width:]
 
         # Select target and condition rows at inference-output positions, then
         # zero the condition rows.
-        video_logits = video_logits.index_select(0, infer_out_pos.to(device))
-        audio_logits = audio_logits.index_select(0, audio_pos.to(device))
-        if not skip_mask_out_condition:
-            update_mask = update_mask.view(-1).to(device)
-            if update_mask.shape[0] != video_logits.shape[0]:
-                raise ValueError(f"update_mask length mismatch: {update_mask.shape[0]} != {video_logits.shape[0]}")
-            video_logits = video_logits * update_mask.unsqueeze(-1)
-            # Audio has no condition rows in the supported tasks, so its
-            # derived update mask is all ones. Honor an explicit mask when
-            # provided.
-            update_audio_mask = kwargs.get("update_audio_mask")
-            if update_audio_mask is not None:
-                audio_logits = audio_logits * update_audio_mask.view(-1).unsqueeze(-1)
+        with h3_dit_range("h3.dit.output_select"):
+            video_logits = video_logits.index_select(0, infer_out_pos.to(device))
+            audio_logits = audio_logits.index_select(0, audio_pos.to(device))
+            if not skip_mask_out_condition:
+                update_mask = update_mask.view(-1).to(device)
+                if update_mask.shape[0] != video_logits.shape[0]:
+                    raise ValueError(f"update_mask length mismatch: {update_mask.shape[0]} != {video_logits.shape[0]}")
+                video_logits = video_logits * update_mask.unsqueeze(-1)
+                # Audio has no condition rows in the supported tasks, so its
+                # derived update mask is all ones. Honor an explicit mask when
+                # provided.
+                update_audio_mask = kwargs.get("update_audio_mask")
+                if update_audio_mask is not None:
+                    audio_logits = audio_logits * update_audio_mask.view(-1).unsqueeze(-1)
         return video_logits, audio_logits
 
 

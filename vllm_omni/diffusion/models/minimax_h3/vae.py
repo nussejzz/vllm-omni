@@ -36,6 +36,7 @@ from vllm_omni.platforms import current_omni_platform
 from .chunked_decode import decode_h3_chunks
 from .ops import install_h3_vae_optimizations
 from .packed_tokens import minimax_h3_patchify_video_latent
+from .profiling import h3_range
 from .vae_temporal import install_temporal_stream_patches
 
 MINIMAX_H3_KEYFRAME_ENCODE_SEED = 42
@@ -1190,42 +1191,45 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
                         self.device_module.manual_seed(MINIMAX_H3_KEYFRAME_ENCODE_SEED)
                 prepared = None
                 if isinstance(frames, np.ndarray) and not _legacy_encode_prep_enabled():
-                    prepared = self._stream_prepare_video_tensor(frames, parameter.device)
+                    with h3_range("h3.vae_video.encode.upload_normalize"):
+                        prepared = self._stream_prepare_video_tensor(frames, parameter.device)
                 if prepared is not None:
                     # Tensor inputs already carry the checkpoint's expected
                     # (3, T, H, W) normalized-FP32 contract, so encode_videos
                     # skips its own convert/transform/pad whole-video copies.
                     frames = [prepared]
-                latent = self.model.encode_videos(
-                    frames,
-                    use_fp16_latent=True,
-                )[0]
+                with h3_range("h3.vae_video.encode"):
+                    latent = self.model.encode_videos(
+                        frames,
+                        use_fp16_latent=True,
+                    )[0]
         finally:
             if previous_dtype != torch.float32:
                 self.to(previous_dtype)
 
-        latent = latent.float().cpu()
-        if latent.ndim == 4:
-            latent = latent[None]
-        channels = int(self.config_dict["latent_channels"])
-        if latent.ndim != 5 or int(latent.shape[1]) != channels:
-            raise ValueError(f"unexpected reference video latent shape {tuple(latent.shape)}")
-        shape = (
-            int(latent.shape[2]),
-            int(latent.shape[3]),
-            int(latent.shape[4]),
-        )
-        mean = torch.tensor(
-            self.config_dict["latents_mean"],
-        ).view(1, channels, 1, 1, 1)
-        std = torch.tensor(
-            self.config_dict["latents_std"],
-        ).view(1, channels, 1, 1, 1)
-        rows = minimax_h3_patchify_video_latent(
-            (latent - mean) / std,
-            patch_size=(1, 2, 2),
-        ).float()
-        return rows, shape
+        with h3_range("h3.vae_video.encode.d2h_patchify"):
+            latent = latent.float().cpu()
+            if latent.ndim == 4:
+                latent = latent[None]
+            channels = int(self.config_dict["latent_channels"])
+            if latent.ndim != 5 or int(latent.shape[1]) != channels:
+                raise ValueError(f"unexpected reference video latent shape {tuple(latent.shape)}")
+            shape = (
+                int(latent.shape[2]),
+                int(latent.shape[3]),
+                int(latent.shape[4]),
+            )
+            mean = torch.tensor(
+                self.config_dict["latents_mean"],
+            ).view(1, channels, 1, 1, 1)
+            std = torch.tensor(
+                self.config_dict["latents_std"],
+            ).view(1, channels, 1, 1, 1)
+            rows = minimax_h3_patchify_video_latent(
+                (latent - mean) / std,
+                patch_size=(1, 2, 2),
+            ).float()
+            return rows, shape
 
     @torch.inference_mode()
     def encode_control_latents(self, pixels: torch.Tensor) -> torch.Tensor:
@@ -1294,8 +1298,9 @@ class MiniMaxH3VideoVAE(nn.Module, DistributedVaeMixin):
         # is dispatched. It comes from the grid geometry alone, so every rank
         # records the same value and the gather never has to choose a
         # collective from rank-local tile shapes.
-        with self._tile_gather_protocol(latent), self._decode_tiling_context(latent):
-            decoded = self.model.decode_base(self._denormalize_latent(latent))
+        with h3_range("h3.vae_video.decode_base"):
+            with self._tile_gather_protocol(latent), self._decode_tiling_context(latent):
+                decoded = self.model.decode_base(self._denormalize_latent(latent))
         if decoded.dtype == torch.uint8:
             # The streaming uint8 write-back already ran the revert and the
             # output quantizer inside write_part; nothing remains but the
@@ -1484,10 +1489,11 @@ class MiniMaxH3AudioVAE(nn.Module):
         if waveform.ndim == 1:
             waveform = waveform[None]
         if int(sample_rate) != MINIMAX_H3_AUDIO_SAMPLE_RATE:
-            waveform = torchaudio.transforms.Resample(
-                int(sample_rate),
-                MINIMAX_H3_AUDIO_SAMPLE_RATE,
-            )(waveform)
+            with h3_range("h3.vae_audio.encode.resample"):
+                waveform = torchaudio.transforms.Resample(
+                    int(sample_rate),
+                    MINIMAX_H3_AUDIO_SAMPLE_RATE,
+                )(waveform)
         if waveform.shape[0] < MINIMAX_H3_AUDIO_CHANNELS:
             waveform = waveform.repeat(
                 MINIMAX_H3_AUDIO_CHANNELS,
@@ -1497,15 +1503,16 @@ class MiniMaxH3AudioVAE(nn.Module):
         device = next(self.model.parameters()).device
         waveform = waveform.to(device)
 
-        with _AudioVAEDeterminismContext():
-            audio = self.model.preprocess(
-                waveform.unsqueeze(1),
-                MINIMAX_H3_AUDIO_SAMPLE_RATE,
-            )
-            latent = self.model.encoder(audio)
-            if bool(getattr(self.model, "attn_proj", False)):
-                latent = self.model.pre_block(latent.transpose(1, 2)).transpose(1, 2)
-            latent = self.model.mean_proj(latent).float().cpu()
+        with h3_range("h3.vae_audio.encode"):
+            with _AudioVAEDeterminismContext():
+                audio = self.model.preprocess(
+                    waveform.unsqueeze(1),
+                    MINIMAX_H3_AUDIO_SAMPLE_RATE,
+                )
+                latent = self.model.encoder(audio)
+                if bool(getattr(self.model, "attn_proj", False)):
+                    latent = self.model.pre_block(latent.transpose(1, 2)).transpose(1, 2)
+                latent = self.model.mean_proj(latent).float().cpu()
 
         channels = int(self.config_dict["latent_channels"])
         if latent.shape[-1] != channels:
@@ -1538,8 +1545,9 @@ class MiniMaxH3AudioVAE(nn.Module):
         ).view(1, channels, 1)
         # The remote decoder's TorchScript activations round differently on
         # their first (unfused) call; keep every request on the same path.
-        with torch.jit.optimized_execution(False):
-            waveform = self.remote.decode(latent * std + mean)
+        with h3_range("h3.vae_audio.decode"):
+            with torch.jit.optimized_execution(False):
+                waveform = self.remote.decode(latent * std + mean)
         if waveform.ndim != 3 or waveform.shape[1] != 1:
             raise ValueError(f"unexpected decoded audio shape {tuple(waveform.shape)}")
         return waveform.permute(1, 0, 2).contiguous().float()

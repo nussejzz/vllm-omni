@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 import torch.distributed as dist
 import zmq
+from torch.profiler import record_function
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.logging import LoggingConfig
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
@@ -1201,14 +1202,15 @@ class DiffusionWorker:
             request = req
 
         if self.lora_manager is not None:
-            try:
-                self.lora_manager.set_request_adapters(
-                    request.sampling_params.lora_request, request.sampling_params.lora_scale
-                )
-            except Exception as exc:
-                if request.sampling_params.lora_request is not None:
-                    raise
-                logger.warning("LoRA activation skipped: %s", exc)
+            with record_function("worker.lora_set_request_adapters"):
+                try:
+                    self.lora_manager.set_request_adapters(
+                        request.sampling_params.lora_request, request.sampling_params.lora_scale
+                    )
+                except Exception as exc:
+                    if request.sampling_params.lora_request is not None:
+                        raise
+                    logger.warning("LoRA activation skipped: %s", exc)
         profiler = self._get_profiler()
         ctx = profiler.annotate_context_manager("diffusion_forward") if profiler else nullcontext()
         with ctx, self._flashinfer_autotune_context([request]):
@@ -2122,7 +2124,8 @@ class WorkerProc:
                     rpc_id = msg.get("rpc_id")
                     result, should_reply = self._execute_rpc(msg)
                     if should_reply:
-                        self._return_result(result, rpc_id=rpc_id)
+                        with record_function("worker.return_result"):
+                            self._return_result(result, rpc_id=rpc_id)
                 except Exception as e:
                     logger.error(f"Error processing RPC: {e}", exc_info=True)
                     error = str(e)

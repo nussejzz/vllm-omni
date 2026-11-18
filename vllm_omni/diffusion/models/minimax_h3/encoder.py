@@ -49,6 +49,8 @@ from vllm_omni.diffusion.offloader.module_residency import (
     PinnedModuleStager,
 )
 
+from .profiling import h3_range
+
 MINIMAX_H3_QWEN3VL_SELECTED_LM_LAYER = 50
 MINIMAX_H3_QWEN3VL_HIDDEN_DIM = 5120
 
@@ -1366,18 +1368,20 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
         deepstack_video_embeds: list[torch.Tensor] | None = None
 
         if pixel_values is not None:
-            image_embeds, deepstack_image_embeds = self.vision(
-                pixel_values.to(device, torch.bfloat16),
-                image_grid_thw.to(device, torch.long),
-            )
+            with h3_range("h3.qwen3vl.vision_image"):
+                image_embeds, deepstack_image_embeds = self.vision(
+                    pixel_values.to(device, torch.bfloat16),
+                    image_grid_thw.to(device, torch.long),
+                )
             image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask, _ = self._get_placeholder_mask(ids, inputs_embeds=inputs_embeds, image_features=image_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
         if pixel_values_videos is not None:
-            video_embeds, deepstack_video_embeds = self.vision(
-                pixel_values_videos.to(device, torch.bfloat16),
-                video_grid_thw.to(device, torch.long),
-            )
+            with h3_range("h3.qwen3vl.vision_video"):
+                video_embeds, deepstack_video_embeds = self.vision(
+                    pixel_values_videos.to(device, torch.bfloat16),
+                    video_grid_thw.to(device, torch.long),
+                )
             video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
             _, video_mask = self._get_placeholder_mask(ids, inputs_embeds=inputs_embeds, video_features=video_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
@@ -1389,20 +1393,22 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
             deepstack_video_embeds,
         )
 
-        positions, _ = _get_rope_index(
-            ids,
-            mm_token_type_ids=mm_types,
-            image_grid_thw=image_grid_thw.to(device, torch.long) if image_grid_thw is not None else None,
-            video_grid_thw=video_grid_thw.to(device, torch.long) if video_grid_thw is not None else None,
-            attention_mask=attention_mask,
-            spatial_merge_size=int(self.vision.config.spatial_merge_size),
-        )
-        hidden = self.text_model(
-            inputs_embeds,
-            positions,
-            visual_pos_masks=visual_pos_masks,
-            deepstack_visual_embeds=deepstack_visual_embeds,
-        )[0]
+        with h3_range("h3.qwen3vl.rope_index"):
+            positions, _ = _get_rope_index(
+                ids,
+                mm_token_type_ids=mm_types,
+                image_grid_thw=image_grid_thw.to(device, torch.long) if image_grid_thw is not None else None,
+                video_grid_thw=video_grid_thw.to(device, torch.long) if video_grid_thw is not None else None,
+                attention_mask=attention_mask,
+                spatial_merge_size=int(self.vision.config.spatial_merge_size),
+            )
+        with h3_range("h3.qwen3vl.text_model"):
+            hidden = self.text_model(
+                inputs_embeds,
+                positions,
+                visual_pos_masks=visual_pos_masks,
+                deepstack_visual_embeds=deepstack_visual_embeds,
+            )[0]
         expected = (int(ids.shape[1]), MINIMAX_H3_QWEN3VL_HIDDEN_DIM)
         if tuple(hidden.shape) != expected:
             raise ValueError(f"unexpected Qwen3-VL hidden shape {tuple(hidden.shape)}, expected {expected}")
@@ -1493,7 +1499,8 @@ class MiniMaxH3Qwen3VLEncoder(nn.Module):
                 pixel_values_videos=pixel_values_videos,
                 video_grid_thw=video_grid_thw,
             )
-            return hidden.cpu()
+            with h3_range("h3.qwen3vl.hidden_d2h"):
+                return hidden.cpu()
         finally:
             torch.backends.cuda.enable_cudnn_sdp(cudnn_sdp_enabled)
 

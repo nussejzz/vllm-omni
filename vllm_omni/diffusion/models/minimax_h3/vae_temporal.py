@@ -32,6 +32,8 @@ from types import MethodType
 import torch
 from vllm.logger import init_logger
 
+from .profiling import h3_range
+
 logger = init_logger(__name__)
 
 _LEGACY_TEMPORAL_ENV = "VLLM_OMNI_VAE_LEGACY_TEMPORAL"
@@ -69,18 +71,19 @@ def _encode_temporal_tail_pad(self, x):
                 dim=2,
             )
 
-        if self.isolated_key_frame:
-            key_frame = clip_x[:, :, :1, :, :]
-            z_key = self._adaptive_encode(key_frame)
+        with h3_range(f"h3.vae_video.encode_clip.{i}"):
+            if self.isolated_key_frame:
+                key_frame = clip_x[:, :, :1, :, :]
+                z_key = self._adaptive_encode(key_frame)
 
-            if clip_x.shape[2] > 1:
-                video_frames = clip_x[:, :, 1:, :, :]
-                z_video = self._adaptive_encode(video_frames)
-                z = torch.cat([z_key, z_video], dim=2)
+                if clip_x.shape[2] > 1:
+                    video_frames = clip_x[:, :, 1:, :, :]
+                    z_video = self._adaptive_encode(video_frames)
+                    z = torch.cat([z_key, z_video], dim=2)
+                else:
+                    z = z_key
             else:
-                z = z_key
-        else:
-            z = self._adaptive_encode(clip_x)
+                z = self._adaptive_encode(clip_x)
 
         z_list.append(z)
 
@@ -90,7 +93,8 @@ def _encode_temporal_tail_pad(self, x):
 
     if self.isolated_first_frame:
         input_first_frame = x[:, :, :1, :, :]
-        z_first_frame = self._adaptive_encode(input_first_frame)
+        with h3_range("h3.vae_video.encode_first_frame"):
+            z_first_frame = self._adaptive_encode(input_first_frame)
 
         if self.frame_pre_padding == 0:
             z = torch.cat([z_first_frame, z], dim=2)
@@ -108,7 +112,8 @@ def _encode_temporal_tail_pad(self, x):
         if 0 <= last_frame_idx < padded_frames:
             src_idx = min(last_frame_idx, orig_frames - 1)
             input_last_frame = x[:, :, src_idx : src_idx + 1, :, :]
-            z_last_frame = self._adaptive_encode(input_last_frame)
+            with h3_range("h3.vae_video.encode_last_frame"):
+                z_last_frame = self._adaptive_encode(input_last_frame)
             z = torch.cat([z, z_last_frame], dim=2)
 
     return z
@@ -153,41 +158,42 @@ def _decode_temporal_streaming_uint8(
 
     def write_part(part):
         nonlocal dec, dec_overlap, norm, write_pos, logical_frames, dropped_frames
-        part_frames = int(part.shape[2])
-        if part_frames <= 0:
-            return
-        logical_frames += part_frames
-        if dec is None:
-            out_shape = list(part.shape)
-            out_shape[2] = output_frames
-            dec = torch.empty(out_shape, dtype=torch.uint8, device=part.device)
-            transform_rev = self.processor.transform_rev
-            mean = torch.as_tensor(transform_rev.mean, dtype=part.dtype, device=part.device).view(1, 3, 1, 1, 1)
-            std = torch.as_tensor(transform_rev.std, dtype=part.dtype, device=part.device).view(1, 3, 1, 1, 1)
-            norm = (mean, std)
-        # revert_tensor ((x - mean) / std, clamp) followed by the output
-        # quantizer (*255, round, uint8), in place on the part: the blended
-        # raw values are consumed before this point, and every write into
-        # ``dec`` goes through here, so the final buffer matches the legacy
-        # post-decode chain element for element. Denormalization and clamping
-        # run in the decoded dtype exactly like the legacy adapter; the
-        # quantizer then runs in FP32 because the legacy adapter returned
-        # ``frames.float()`` before the pipeline multiplied and rounded —
-        # rounding fp16/bf16 directly flips borderline pixels by one.
-        if pixel_transform is None:
-            mean_t, std_t = norm
-            part.sub_(mean_t).div_(std_t).clamp_(0.0, 1.0)
-            part = part.float()
-        else:
-            part = pixel_transform(part)
-        part.mul_(255.0).round_()
+        with h3_range("h3.vae_video.write_uint8"):
+            part_frames = int(part.shape[2])
+            if part_frames <= 0:
+                return
+            logical_frames += part_frames
+            if dec is None:
+                out_shape = list(part.shape)
+                out_shape[2] = output_frames
+                dec = torch.empty(out_shape, dtype=torch.uint8, device=part.device)
+                transform_rev = self.processor.transform_rev
+                mean = torch.as_tensor(transform_rev.mean, dtype=part.dtype, device=part.device).view(1, 3, 1, 1, 1)
+                std = torch.as_tensor(transform_rev.std, dtype=part.dtype, device=part.device).view(1, 3, 1, 1, 1)
+                norm = (mean, std)
+            # revert_tensor ((x - mean) / std, clamp) followed by the output
+            # quantizer (*255, round, uint8), in place on the part: the blended
+            # raw values are consumed before this point, and every write into
+            # ``dec`` goes through here, so the final buffer matches the legacy
+            # post-decode chain element for element. Denormalization and clamping
+            # run in the decoded dtype exactly like the legacy adapter; the
+            # quantizer then runs in FP32 because the legacy adapter returned
+            # ``frames.float()`` before the pipeline multiplied and rounded —
+            # rounding fp16/bf16 directly flips borderline pixels by one.
+            if pixel_transform is None:
+                mean_t, std_t = norm
+                part.sub_(mean_t).div_(std_t).clamp_(0.0, 1.0)
+                part = part.float()
+            else:
+                part = pixel_transform(part)
+            part.mul_(255.0).round_()
 
-        remaining = int(dec.shape[2]) - write_pos
-        copy_frames = min(part_frames, max(0, remaining))
-        if copy_frames > 0:
-            dec[:, :, write_pos : write_pos + copy_frames, :, :].copy_(part[:, :, :copy_frames, :, :])
-            write_pos += copy_frames
-        dropped_frames += part_frames - copy_frames
+            remaining = int(dec.shape[2]) - write_pos
+            copy_frames = min(part_frames, max(0, remaining))
+            if copy_frames > 0:
+                dec[:, :, write_pos : write_pos + copy_frames, :, :].copy_(part[:, :, :copy_frames, :, :])
+                write_pos += copy_frames
+            dropped_frames += part_frames - copy_frames
 
     for i in range(num_chunks):
         t_start_idx = i * self.tokens_chunk_size
@@ -200,7 +206,8 @@ def _decode_temporal_streaming_uint8(
         if i == num_chunks - 1 and z_tail is not None:
             clip_z = torch.cat([clip_z, z_tail], dim=2)
 
-        clip_dec = self._adaptive_decode(clip_z)
+        with h3_range(f"h3.vae_video.clip_decode.{i}"):
+            clip_dec = self._adaptive_decode(clip_z)
         decoded_count += 1
         if temporal_cat_dtype is not None and clip_dec.dtype != temporal_cat_dtype:
             clip_dec = clip_dec.to(temporal_cat_dtype)
@@ -224,7 +231,8 @@ def _decode_temporal_streaming_uint8(
 
             if j == 0:
                 if dec_overlap is not None:
-                    clip_dec_chunk = self.blend(dec_overlap, clip_dec_chunk, self.frame_overlap, dim=-3)
+                    with h3_range("h3.vae_video.blend"):
+                        clip_dec_chunk = self.blend(dec_overlap, clip_dec_chunk, self.frame_overlap, dim=-3)
                     dec_overlap = None
                 write_part(clip_dec_chunk)
             else:

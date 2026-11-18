@@ -933,15 +933,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         use_distributed_offload = resolve_offload_strategy(self.od_config) is OffloadStrategy.DISTRIBUTED_LAYER_WISE
         grad_context = torch.no_grad() if (use_hsdp or use_distributed_offload) else torch.inference_mode()
         with grad_context:
-            for req in reqs:
-                self._prepare_request_for_forward(
-                    req,
-                    od_config=od_config,
-                    kv_prefetch_job=kv_prefetch_job,
-                    use_prefetch=allow_single_output,
-                )
+            with record_function("runner.prepare_request"):
+                for req in reqs:
+                    self._prepare_request_for_forward(
+                        req,
+                        od_config=od_config,
+                        kv_prefetch_job=kv_prefetch_job,
+                        use_prefetch=allow_single_output,
+                    )
 
-            self._refresh_cache_for_requests(reqs, od_config=od_config)
+                self._refresh_cache_for_requests(reqs, od_config=od_config)
 
             batch = DiffusionRequestBatch(requests=reqs)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0

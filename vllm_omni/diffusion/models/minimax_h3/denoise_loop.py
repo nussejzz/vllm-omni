@@ -27,6 +27,7 @@ from vllm_omni.diffusion.sampler import RENOISE_SAMPLER, RenoiseNoiseSource, Sam
 from vllm_omni.platforms import current_omni_platform
 
 from .latent_mask import MiniMaxH3LatentEdit
+from .profiling import h3_range
 from .sampling import MiniMaxH3Model, MiniMaxH3ModelBatch
 
 MINIMAX_H3_IMGVID_COND_TIMESTEP = 0.999
@@ -359,14 +360,15 @@ def minimax_h3_denoise_loop(
     # Ascend-specific performance optimization and must not alter that path.
     if current_omni_platform.is_npu():
         positive.prepare_rope_table(model)
-    video_rows, audio_rows = minimax_h3_prepare_denoise_rows(
-        positive=positive,
-        initial_video_rows=initial_video_rows,
-        initial_audio_rows=initial_audio_rows,
-        keyframe_cond_rows=keyframe_cond_rows,
-        audio_ref_rows=audio_ref_rows,
-        device=device,
-    )
+    with h3_range("h3.denoise.prepare_rows"):
+        video_rows, audio_rows = minimax_h3_prepare_denoise_rows(
+            positive=positive,
+            initial_video_rows=initial_video_rows,
+            initial_audio_rows=initial_audio_rows,
+            keyframe_cond_rows=keyframe_cond_rows,
+            audio_ref_rows=audio_ref_rows,
+            device=device,
+        )
     update = positive.update_mask_dev
     audio_update = positive.audio_update_mask_dev
     if video_edit is not None:
@@ -393,28 +395,33 @@ def minimax_h3_denoise_loop(
     if reference_kv_state is not None:
         positive.static_kwargs["reference_kv_state"] = reference_kv_state
 
-    adapter = MiniMaxH3Model(
-        model,
-        positive,
-        (video_rows, audio_rows),
-        (video_edit, audio_edit),
-        (imgvid_cond_noise_aug_for_inference, audio_cond_noise_aug_for_inference),
-        grid_sigma_x0=noise_source is not None,
-    )
-    state = SamplingState(
-        (video_rows[update], audio_rows[audio_update]), (sigmas_video, sigmas_audio), history=noise_source
-    )
+    with h3_range("h3.denoise.sampler_setup"):
+        adapter = MiniMaxH3Model(
+            model,
+            positive,
+            (video_rows, audio_rows),
+            (video_edit, audio_edit),
+            (imgvid_cond_noise_aug_for_inference, audio_cond_noise_aug_for_inference),
+            grid_sigma_x0=noise_source is not None,
+        )
+        state = SamplingState(
+            (video_rows[update], audio_rows[audio_update]), (sigmas_video, sigmas_audio), history=noise_source
+        )
 
     def write_back_and_update_progress(state):
         nonlocal video_rows, audio_rows
-        adapter.validate_write_back(state)
-        video_rows, audio_rows = adapter.write_back(state)
+        with h3_range(f"h3.denoise.write_back.{state.step_index - 1}"):
+            adapter.validate_write_back(state)
+            video_rows, audio_rows = adapter.write_back(state)
         if update_progress is not None:
-            update_progress(state.step_index - 1, video_rows, audio_rows)
-        check_request_cancellation(synchronize=True)
+            with h3_range(f"h3.denoise.progress.{state.step_index - 1}"):
+                update_progress(state.step_index - 1, video_rows, audio_rows)
+        with h3_range(f"h3.denoise.cancel_sync.{state.step_index - 1}"):
+            check_request_cancellation(synchronize=True)
 
     def step_context(states):
-        check_request_cancellation()
+        with h3_range(f"h3.denoise.cancel_check.{states[0].step_index}"):
+            check_request_cancellation()
         return step_profiler(states[0].step_index) if step_profiler is not None else nullcontext()
 
     try:

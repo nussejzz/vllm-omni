@@ -25,6 +25,14 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 
 import torch
+from torch.profiler import record_function
+
+
+def _range(name: str) -> AbstractContextManager:
+    """Profiler range only while a profiler is active on this thread (no-op otherwise / under compile)."""
+    if torch.compiler.is_compiling() or not torch.autograd._profiler_enabled():
+        return nullcontext()
+    return record_function(name)
 
 
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
@@ -190,21 +198,23 @@ StepContext = Callable[[Sequence[SamplingState]], AbstractContextManager]
 
 
 def _evaluate(model: DenoiseModel, evaluations: list[ModelEvaluation]) -> Sequence[Latents]:
-    for evaluation in evaluations:
-        for latent in evaluation.latents:
-            if not torch.is_floating_point(latent):
-                raise ValueError("Latents must be floating point")
-            _require_finite_tensor(latent, "Model input")
+    with _range(f"sampler.check_inputs.{evaluations[0].state.step_index if evaluations else -1}"):
+        for evaluation in evaluations:
+            for latent in evaluation.latents:
+                if not torch.is_floating_point(latent):
+                    raise ValueError("Latents must be floating point")
+                _require_finite_tensor(latent, "Model input")
     predictions = model(evaluations)
-    if len(predictions) != len(evaluations):
-        raise ValueError("Model must return one prediction per request")
-    for evaluation, prediction in zip(evaluations, predictions, strict=True):
-        if len(prediction) != len(evaluation.latents):
-            raise ValueError("Model must return one x0 per latent stream")
-        for x, x0 in zip(evaluation.latents, prediction, strict=True):
-            if x.shape != x0.shape or not torch.is_floating_point(x0):
-                raise ValueError("Model predictions must match latent shapes and be floating point")
-            _require_finite_tensor(x0, "Model prediction")
+    with _range(f"sampler.check_x0.{evaluations[0].state.step_index if evaluations else -1}"):
+        if len(predictions) != len(evaluations):
+            raise ValueError("Model must return one prediction per request")
+        for evaluation, prediction in zip(evaluations, predictions, strict=True):
+            if len(prediction) != len(evaluation.latents):
+                raise ValueError("Model must return one x0 per latent stream")
+            for x, x0 in zip(evaluation.latents, prediction, strict=True):
+                if x.shape != x0.shape or not torch.is_floating_point(x0):
+                    raise ValueError("Model predictions must match latent shapes and be floating point")
+                _require_finite_tensor(x0, "Model prediction")
     return predictions
 
 
@@ -235,9 +245,10 @@ def _commit(
     # Validate the whole batch before publishing any of its new latent states.
     if len(outputs) != len(states) or (histories is not None and len(histories) != len(states)):
         raise ValueError("Each sampling state requires one output and, when supplied, one history")
-    for output in outputs:
-        for tensor in output:
-            _require_finite_tensor(tensor, "Sampler output")
+    with _range(f"sampler.check_outputs.{states[0].step_index if states else -1}"):
+        for output in outputs:
+            for tensor in output:
+                _require_finite_tensor(tensor, "Sampler output")
     for index, (state, output) in enumerate(zip(states, outputs, strict=True)):
         state.latents = tuple(output)
         state.step_index += 1
@@ -259,15 +270,20 @@ def sample_euler(
     """Euler integration; the algorithm owns every model call."""
     for active in _sampling_steps(states, num_steps):
         with step_context(active) if step_context else nullcontext():
-            predictions = _evaluate(model, _current_evaluations(active))
-            outputs = [
-                tuple(
-                    euler_eta0_step(x, x0, sigma_curr=s[state.step_index], sigma_next=s[state.step_index + 1])
-                    for x, x0, s in zip(state.latents, prediction, state.sigmas, strict=True)
-                )
-                for state, prediction in zip(active, predictions, strict=True)
-            ]
-            _commit(active, outputs, callback)
+            with _range(f"sampler.step.{active[0].step_index}"):
+                predictions = _evaluate(model, _current_evaluations(active))
+                with _range(f"sampler.euler.{active[0].step_index}"):
+                    outputs = [
+                        tuple(
+                            euler_eta0_step(
+                                x, x0, sigma_curr=s[state.step_index], sigma_next=s[state.step_index + 1]
+                            )
+                            for x, x0, s in zip(state.latents, prediction, state.sigmas, strict=True)
+                        )
+                        for state, prediction in zip(active, predictions, strict=True)
+                    ]
+                with _range(f"sampler.commit.{active[0].step_index}"):
+                    _commit(active, outputs, callback)
 
 
 def sample_res_multistep(
@@ -368,26 +384,32 @@ def sample_renoise(
     """
     for active in _sampling_steps(states, num_steps):
         with step_context(active) if step_context else nullcontext():
-            sources = []
-            for state in active:
-                if not isinstance(state.history, RenoiseNoiseSource):
-                    raise ValueError("Re-noise sampling requires a RenoiseNoiseSource history")
-                sources.append(state.history)
-            predictions = _evaluate(model, _current_evaluations(active))
-            outputs = []
-            for state, source, prediction in zip(active, sources, predictions, strict=True):
-                i = state.step_index
-                next_sigmas = tuple(float(s[i + 1]) for s in state.sigmas)
-                noise = source.draw(i, tuple(None if n == 0.0 else x0 for x0, n in zip(prediction, next_sigmas)))
-                if len(noise) != len(prediction):
-                    raise ValueError("Re-noise source must return one entry per latent stream")
-                outputs.append(
-                    tuple(
-                        renoise_step(x0, eps, sigma_next=n)
-                        for x0, eps, n in zip(prediction, noise, next_sigmas, strict=True)
-                    )
-                )
-            _commit(active, outputs, callback)
+            with _range(f"sampler.step.{active[0].step_index}"):
+                sources = []
+                for state in active:
+                    if not isinstance(state.history, RenoiseNoiseSource):
+                        raise ValueError("Re-noise sampling requires a RenoiseNoiseSource history")
+                    sources.append(state.history)
+                predictions = _evaluate(model, _current_evaluations(active))
+                with _range(f"sampler.renoise.{active[0].step_index}"):
+                    outputs = []
+                    for state, source, prediction in zip(active, sources, predictions, strict=True):
+                        i = state.step_index
+                        next_sigmas = tuple(float(s[i + 1]) for s in state.sigmas)
+                        with _range(f"sampler.draw.{i}"):
+                            noise = source.draw(
+                                i, tuple(None if n == 0.0 else x0 for x0, n in zip(prediction, next_sigmas))
+                            )
+                        if len(noise) != len(prediction):
+                            raise ValueError("Re-noise source must return one entry per latent stream")
+                        outputs.append(
+                            tuple(
+                                renoise_step(x0, eps, sigma_next=n)
+                                for x0, eps, n in zip(prediction, noise, next_sigmas, strict=True)
+                            )
+                        )
+                with _range(f"sampler.commit.{active[0].step_index}"):
+                    _commit(active, outputs, callback)
 
 
 class Sampler(ABC):

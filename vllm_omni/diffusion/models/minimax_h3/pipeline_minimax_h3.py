@@ -210,6 +210,7 @@ from .pika import (
     load_pika_golden_conditioning,
     read_pika_spec,
 )
+from .profiling import h3_range
 from .quality_policy import MINIMAX_H3_GENERIC_CACHE_KEY, MiniMaxH3QualityPolicy
 from .regenerate import (
     REGENERATE_DEFAULT_UPSCALE,
@@ -2307,16 +2308,18 @@ class MiniMaxH3Pipeline(
             video_sigmas = pika.video_sigmas
             audio_sigmas = pika.audio_sigmas
             # Every SP rank draws the same full tensors on its own device; see PikaNoise.
-            noise_source = PikaNoise(
-                seed=seed,
-                device=self.device,
-                latent_t=latent_t,
-                latent_h=latent_h,
-                latent_w=latent_w,
-                audio_t=audio_t,
-            )
-            initial_video, initial_audio = noise_source.initial_rows()
-            _check_replicated_across_dit_ranks(initial_video, initial_audio, what=f"{pika.name} initial noise")
+            with h3_range("h3.prepare.pika_initial_noise"):
+                noise_source = PikaNoise(
+                    seed=seed,
+                    device=self.device,
+                    latent_t=latent_t,
+                    latent_h=latent_h,
+                    latent_w=latent_w,
+                    audio_t=audio_t,
+                )
+                initial_video, initial_audio = noise_source.initial_rows()
+            with h3_range("h3.prepare.pika_noise_replica_check"):
+                _check_replicated_across_dit_ranks(initial_video, initial_audio, what=f"{pika.name} initial noise")
             logger.info(
                 "%s request: seed=%d noise=%s (initial %d, re-noise %d, augmentation %d), video rows %s, audio rows %s",
                 pika.name,
@@ -2384,18 +2387,19 @@ class MiniMaxH3Pipeline(
                     {"kind": "image", "latent_h": ref_h, "latent_w": ref_w},
                     {"kind": "audio", "ref_audio_t": ref_audio_t},
                 ]
-            packed = minimax_h3_packed_sequence_ref2va_blocks(
-                text_len=int(text_embeddings.shape[0]),
-                latent_t=latent_t,
-                latent_h=latent_h,
-                latent_w=latent_w,
-                audio_t=audio_t,
-                ref_blocks=ref_blocks or [],
-                guide_blocks=guide_blocks,
-                seq_len=pad_seq_len,
-                temporal_offset=temporal_offset,
-                media_time_origin=media_time_origin,
-            )
+            with h3_range("h3.prepare.packed_layout"):
+                packed = minimax_h3_packed_sequence_ref2va_blocks(
+                    text_len=int(text_embeddings.shape[0]),
+                    latent_t=latent_t,
+                    latent_h=latent_h,
+                    latent_w=latent_w,
+                    audio_t=audio_t,
+                    ref_blocks=ref_blocks or [],
+                    guide_blocks=guide_blocks,
+                    seq_len=pad_seq_len,
+                    temporal_offset=temporal_offset,
+                    media_time_origin=media_time_origin,
+                )
         else:
             packed = minimax_h3_packed_sequence(
                 text_len=int(text_embeddings.shape[0]),
@@ -2420,14 +2424,15 @@ class MiniMaxH3Pipeline(
             int(packed["seq_len"]),
         )
 
-        tags = packed["token_tags"].clone()
-        tags[packed["text_pos"]] = text_tags.cpu()
-        branch = MiniMaxH3DenoiseBranch(
-            packed=packed,
-            text_embeddings=text_embeddings,
-            token_tags=tags,
-            device=self.device,
-        )
+        with h3_range("h3.prepare.denoise_branch"):
+            tags = packed["token_tags"].clone()
+            tags[packed["text_pos"]] = text_tags.cpu()
+            branch = MiniMaxH3DenoiseBranch(
+                packed=packed,
+                text_embeddings=text_embeddings,
+                token_tags=tags,
+                device=self.device,
+            )
 
         if control_rows is not None:
             branch.static_kwargs.update(
@@ -2445,7 +2450,10 @@ class MiniMaxH3Pipeline(
             if noise_source is not None:
                 assert pika is not None
                 # Pika draws one augmentation tensor per visual reference, in packed order.
-                visual_anchor = noise_source.visual_anchor(visual_anchor, condition_shapes, pika.conditioning_dtype)
+                with h3_range("h3.prepare.pika_visual_anchor"):
+                    visual_anchor = noise_source.visual_anchor(
+                        visual_anchor, condition_shapes, pika.conditioning_dtype
+                    )
             else:
                 visual_anchor = minimax_h3_imgvid_cond_noise_aug_rows(
                     visual_anchor,
@@ -2457,14 +2465,15 @@ class MiniMaxH3Pipeline(
                     precomputed_noise_rows=precomputed_visual_condition_noise,
                     guided=bool(guide_blocks),
                 )
-            full_video = torch.zeros(
-                branch.img_pos.shape[0],
-                96,
-                dtype=torch.float32,
-                device=initial_video.device,
-            )
-            full_video[branch.update_mask.to(initial_video.device)] = initial_video
-            initial_video = full_video
+            with h3_range("h3.prepare.scatter_video_rows"):
+                full_video = torch.zeros(
+                    branch.img_pos.shape[0],
+                    96,
+                    dtype=torch.float32,
+                    device=initial_video.device,
+                )
+                full_video[branch.update_mask.to(initial_video.device)] = initial_video
+                initial_video = full_video
 
         if locked_audio_rows is not None:
             expected = (2 * audio_t, 32)
@@ -2480,21 +2489,22 @@ class MiniMaxH3Pipeline(
                 condition_audio_t = [ref_audio_t]
             if not condition_audio_t:
                 raise ValueError("reference audio length is missing")
-            audio_anchor = minimax_h3_audio_cond_noise_aug_rows(
-                audio_anchor,
-                condition_audio_t=condition_audio_t,
-                seed=seed,
-                noise_aug=MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
-                guided=bool(guide_blocks),
-            )
-            full_audio = torch.zeros(
-                branch.audio_pos.shape[0],
-                32,
-                dtype=torch.float32,
-                device=initial_audio.device,
-            )
-            full_audio[branch.audio_update_mask.to(initial_audio.device)] = initial_audio
-            initial_audio = full_audio
+            with h3_range("h3.prepare.audio_anchor"):
+                audio_anchor = minimax_h3_audio_cond_noise_aug_rows(
+                    audio_anchor,
+                    condition_audio_t=condition_audio_t,
+                    seed=seed,
+                    noise_aug=MINIMAX_H3_AUDIO_REF_COND_TIMESTEP,
+                    guided=bool(guide_blocks),
+                )
+                full_audio = torch.zeros(
+                    branch.audio_pos.shape[0],
+                    32,
+                    dtype=torch.float32,
+                    device=initial_audio.device,
+                )
+                full_audio[branch.audio_update_mask.to(initial_audio.device)] = initial_audio
+                initial_audio = full_audio
 
         video_edit = None
         video_edit_values = (video_edit_clean_rows, video_edit_mask_rows, video_edit_restore_mask_rows)
@@ -2643,52 +2653,55 @@ class MiniMaxH3Pipeline(
                 visual_condition = golden_visual.to(device=visual_condition.device, dtype=visual_condition.dtype)
         # Consume request-owned noise here so caller keyword dictionaries cannot
         # keep the host buffers alive throughout denoising.
-        inputs = self._build_denoise_inputs(
-            pika=pika,
-            sampler=sampler,
-            task=task,
-            text_embeddings=text_embeddings,
-            text_tags=text_tags,
-            seed=seed,
-            latent_t=latent_t,
-            latent_h=latent_h,
-            latent_w=latent_w,
-            audio_t=audio_t,
-            num_frames=num_frames,
-            num_steps=num_steps,
-            video_shift=video_shift,
-            audio_shift=audio_shift,
-            base_schedule=base_schedule,
-            visual_condition=visual_condition,
-            visual_condition_shape=visual_condition_shape,
-            audio_condition=audio_condition,
-            ref_audio_t=ref_audio_t,
-            ref_blocks=ref_blocks,
-            visual_condition_shapes=visual_condition_shapes,
-            audio_condition_lengths=audio_condition_lengths,
-            keyframe_frame_indices=keyframe_frame_indices,
-            control_rows=control_rows,
-            control_context_scale=control_context_scale,
-            guide_blocks=guide_blocks,
-            pad_seq_len=pad_seq_len,
-            locked_audio_rows=locked_audio_rows,
-            temporal_offset=temporal_offset,
-            media_time_origin=media_time_origin,
-            video_edit_clean_rows=video_edit_clean_rows,
-            video_edit_mask_rows=video_edit_mask_rows,
-            video_edit_restore_mask_rows=video_edit_restore_mask_rows,
-            audio_edit_clean_rows=audio_edit_clean_rows,
-            audio_edit_mask_rows=audio_edit_mask_rows,
-            audio_edit_restore_mask_rows=audio_edit_restore_mask_rows,
-            init_latents=init_latents,
-            refine=refine,
-            precomputed_initial_noise=(
-                None if request_context is None else request_context.pop("precomputed_initial_noise", None)
-            ),
-            precomputed_visual_condition_noise=(
-                None if request_context is None else request_context.pop("precomputed_visual_condition_noise", None)
-            ),
-        )
+        with h3_range("h3.prepare"):
+            inputs = self._build_denoise_inputs(
+                pika=pika,
+                sampler=sampler,
+                task=task,
+                text_embeddings=text_embeddings,
+                text_tags=text_tags,
+                seed=seed,
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                audio_t=audio_t,
+                num_frames=num_frames,
+                num_steps=num_steps,
+                video_shift=video_shift,
+                audio_shift=audio_shift,
+                base_schedule=base_schedule,
+                visual_condition=visual_condition,
+                visual_condition_shape=visual_condition_shape,
+                audio_condition=audio_condition,
+                ref_audio_t=ref_audio_t,
+                ref_blocks=ref_blocks,
+                visual_condition_shapes=visual_condition_shapes,
+                audio_condition_lengths=audio_condition_lengths,
+                keyframe_frame_indices=keyframe_frame_indices,
+                control_rows=control_rows,
+                control_context_scale=control_context_scale,
+                guide_blocks=guide_blocks,
+                pad_seq_len=pad_seq_len,
+                locked_audio_rows=locked_audio_rows,
+                temporal_offset=temporal_offset,
+                media_time_origin=media_time_origin,
+                video_edit_clean_rows=video_edit_clean_rows,
+                video_edit_mask_rows=video_edit_mask_rows,
+                video_edit_restore_mask_rows=video_edit_restore_mask_rows,
+                audio_edit_clean_rows=audio_edit_clean_rows,
+                audio_edit_mask_rows=audio_edit_mask_rows,
+                audio_edit_restore_mask_rows=audio_edit_restore_mask_rows,
+                init_latents=init_latents,
+                refine=refine,
+                precomputed_initial_noise=(
+                    None if request_context is None else request_context.pop("precomputed_initial_noise", None)
+                ),
+                precomputed_visual_condition_noise=(
+                    None
+                    if request_context is None
+                    else request_context.pop("precomputed_visual_condition_noise", None)
+                ),
+            )
         branch = inputs["branch"]
         transformer = self._transformer_for_task(task)
         # Each pass (including each output and hi-res refine) owns its cache.
@@ -2729,36 +2742,38 @@ class MiniMaxH3Pipeline(
                 dump.save(f"01_step{step}_rows", video_rows=video, audio_rows=audio)
             progress.update()
 
-        with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
-            with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
-                video_rows, audio_rows = minimax_h3_denoise_loop(
-                    sampler=inputs["sampler"],
-                    noise_source=inputs["noise_source"],
-                    model=transformer,
-                    positive=branch,
-                    initial_video_rows=inputs["video_rows"],
-                    initial_audio_rows=inputs["audio_rows"],
-                    keyframe_cond_rows=inputs["cond_anchor"],
-                    audio_ref_rows=inputs["audio_anchor"],
-                    sigmas_video=inputs["sigmas_video"],
-                    sigmas_audio=inputs["sigmas_audio"],
-                    device=self.device,
-                    imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
-                    audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
-                    video_edit=inputs["video_edit"],
-                    audio_edit=inputs["audio_edit"],
-                    update_progress=on_step,
-                )
+        with h3_range("h3.denoise"):
+            with self._resident_dit_layers_on_device(enabled=transformer is self.transformer):
+                with self.progress_bar(total=len(inputs["sigmas_video"]) - 1) as progress:
+                    video_rows, audio_rows = minimax_h3_denoise_loop(
+                        sampler=inputs["sampler"],
+                        noise_source=inputs["noise_source"],
+                        model=transformer,
+                        positive=branch,
+                        initial_video_rows=inputs["video_rows"],
+                        initial_audio_rows=inputs["audio_rows"],
+                        keyframe_cond_rows=inputs["cond_anchor"],
+                        audio_ref_rows=inputs["audio_anchor"],
+                        sigmas_video=inputs["sigmas_video"],
+                        sigmas_audio=inputs["sigmas_audio"],
+                        device=self.device,
+                        imgvid_cond_noise_aug_for_inference=(MINIMAX_H3_IMGVID_COND_TIMESTEP),
+                        audio_cond_noise_aug_for_inference=(MINIMAX_H3_AUDIO_REF_COND_TIMESTEP),
+                        video_edit=inputs["video_edit"],
+                        audio_edit=inputs["audio_edit"],
+                        update_progress=on_step,
+                    )
 
-        return self._unpack_denoised_rows(
-            branch,
-            video_rows,
-            audio_rows,
-            latent_t=latent_t,
-            latent_h=latent_h,
-            latent_w=latent_w,
-            audio_t=audio_t,
-        )
+        with h3_range("h3.post.unpack_rows"):
+            return self._unpack_denoised_rows(
+                branch,
+                video_rows,
+                audio_rows,
+                latent_t=latent_t,
+                latent_h=latent_h,
+                latent_w=latent_w,
+                audio_t=audio_t,
+            )
 
     def decode_to_mp4(
         self,
@@ -2884,18 +2899,21 @@ class MiniMaxH3Pipeline(
         # Denoise just ended: its freed activation pages must not stay mapped
         # through the VAE decode peak. Decoding needs only the ViT decoder
         # half of the VAE, so the CNN encoder stays off the device.
-        self._release_stage_cache()
-        with self._component_on_device(self.video_vae.decoder_component):
-            with current_omni_platform.create_autocast_context(
-                device_type=self.device.type,
-                dtype=self.video_vae.decode_dtype,
-                enabled=self.video_vae.decode_dtype != torch.float32,
-            ):
-                video = self.video_vae.decode_latent(video_latent)
-        video = video[..., :height, :width].contiguous()
-        with self._component_on_device(self.audio_vae):
-            audio = self.audio_vae.decode_latent(audio_latent)
-        audio = self._offload_model_cpu_stage_output(audio)
+        with h3_range("h3.decode.release_stage_cache"):
+            self._release_stage_cache()
+        with h3_range("h3.decode.video_vae"):
+            with self._component_on_device(self.video_vae.decoder_component):
+                with current_omni_platform.create_autocast_context(
+                    device_type=self.device.type,
+                    dtype=self.video_vae.decode_dtype,
+                    enabled=self.video_vae.decode_dtype != torch.float32,
+                ):
+                    video = self.video_vae.decode_latent(video_latent)
+            video = video[..., :height, :width].contiguous()
+        with h3_range("h3.decode.audio_vae"):
+            with self._component_on_device(self.audio_vae):
+                audio = self.audio_vae.decode_latent(audio_latent)
+            audio = self._offload_model_cpu_stage_output(audio)
         return video, audio
 
     def _resolve_latent_upscale(
@@ -3141,42 +3159,48 @@ class MiniMaxH3Pipeline(
             try:
                 if prepared is None:
                     raise ValueError("rank 0 must prepare MiniMax H3 text inputs")
-                if prepared.images:
-                    vision = self.processor.image_processor(images=prepared.images, return_tensors="pt")
-                    vision_kwargs.update(
-                        pixel_values=vision["pixel_values"],
-                        image_grid_thw=vision["image_grid_thw"],
+                with h3_range("h3.encode.text.qwen_processor"):
+                    if prepared.images:
+                        vision = self.processor.image_processor(images=prepared.images, return_tensors="pt")
+                        vision_kwargs.update(
+                            pixel_values=vision["pixel_values"],
+                            image_grid_thw=vision["image_grid_thw"],
+                        )
+                    if prepared.qwen_videos:
+                        vision = self.processor.video_processor(
+                            videos=[frames for frames, _ in prepared.qwen_videos],
+                            do_sample_frames=False,
+                            return_tensors="pt",
+                        )
+                        vision_kwargs.update(
+                            pixel_values_videos=vision["pixel_values_videos"],
+                            video_grid_thw=vision["video_grid_thw"],
+                        )
+                with h3_range("h3.encode.text.tokenize"):
+                    ids, tags = build_minimax_h3_presentation(
+                        self.tokenizer,
+                        prompt=prepared.prompt,
+                        task=prepared.media.task,
+                        condition_labels=prepared.condition_labels,
+                        image_grid_thw=vision_kwargs.get("image_grid_thw"),
+                        video_grid_thw=vision_kwargs.get("video_grid_thw"),
+                        video_timestamps=prepared.video_timestamps,
+                        merge_size=int(self.processor.image_processor.merge_size),
                     )
-                if prepared.qwen_videos:
-                    vision = self.processor.video_processor(
-                        videos=[frames for frames, _ in prepared.qwen_videos],
-                        do_sample_frames=False,
-                        return_tensors="pt",
-                    )
-                    vision_kwargs.update(
-                        pixel_values_videos=vision["pixel_values_videos"],
-                        video_grid_thw=vision["video_grid_thw"],
-                    )
-                ids, tags = build_minimax_h3_presentation(
-                    self.tokenizer,
-                    prompt=prepared.prompt,
-                    task=prepared.media.task,
-                    condition_labels=prepared.condition_labels,
-                    image_grid_thw=vision_kwargs.get("image_grid_thw"),
-                    video_grid_thw=vision_kwargs.get("video_grid_thw"),
-                    video_timestamps=prepared.video_timestamps,
-                    merge_size=int(self.processor.image_processor.merge_size),
-                )
             except Exception as exc:
                 error = exc
-        _broadcast_rank0_exception(error)
+        with h3_range("h3.encode.text.wait_rank0"):
+            _broadcast_rank0_exception(error)
         if rank < self.text_encoder_tp_size:
-            ids = self._distribute_encode_inputs(ids, vision_kwargs)
-            hidden = self._encode_text_hidden(ids, vision_kwargs)
-        return (
-            _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
-            _broadcast_tensor(tags, dtype=torch.long, device=self.device),
-        )
+            with h3_range("h3.encode.text.distribute_inputs"):
+                ids = self._distribute_encode_inputs(ids, vision_kwargs)
+            with h3_range("h3.encode.text.qwen3vl"):
+                hidden = self._encode_text_hidden(ids, vision_kwargs)
+        with h3_range("h3.encode.text.broadcast"):
+            return (
+                _broadcast_tensor(hidden, dtype=torch.bfloat16, device=self.device),
+                _broadcast_tensor(tags, dtype=torch.long, device=self.device),
+            )
 
     def _distribute_media_inputs(self, media: MiniMaxH3EncoderMediaInput | None) -> MiniMaxH3EncoderMediaInput:
         group, rank, world_size = _dit_rank_world()
@@ -3240,19 +3264,21 @@ class MiniMaxH3Pipeline(
         group, rank, world_size = _dit_rank_world()
         distributed_video = self.video_vae.is_distributed_enabled()
         if distributed_video:
-            media = self._distribute_media_inputs(media)
+            with h3_range("h3.encode.media.distribute_inputs"):
+                media = self._distribute_media_inputs(media)
         conditioning = None
         error = None
         try:
             if rank == 0 or distributed_video:
                 assert media is not None
-                conditioning = encode_media(
-                    media,
-                    video_vae=self.video_vae,
-                    audio_vae=self.audio_vae,
-                    emit_conditioning=rank == 0,
-                    component_scope=self._component_on_device,
-                )
+                with h3_range("h3.encode.media.vae_encode"):
+                    conditioning = encode_media(
+                        media,
+                        video_vae=self.video_vae,
+                        audio_vae=self.audio_vae,
+                        emit_conditioning=rank == 0,
+                        component_scope=self._component_on_device,
+                    )
         except ValueError as exc:
             error = OmniClientError(str(exc))
         except Exception as exc:
@@ -3261,7 +3287,8 @@ class MiniMaxH3Pipeline(
             # All participants finish the codec phase before any latent broadcast.
             errors = [None] * world_size
             info = (str(error), isinstance(error, OmniClientError)) if error is not None else None
-            dist.all_gather_object(errors, info, group=group)
+            with h3_range("h3.encode.media.wait_codec_barrier"):
+                dist.all_gather_object(errors, info, group=group)
             for info in errors:
                 if info is not None:
                     if error is not None:
@@ -3270,7 +3297,8 @@ class MiniMaxH3Pipeline(
                     raise OmniClientError(message) if is_client_error else RuntimeError(message)
         elif error is not None:
             raise error
-        return self._broadcast_media_conditioning(conditioning)
+        with h3_range("h3.encode.media.broadcast"):
+            return self._broadcast_media_conditioning(conditioning)
 
     def _predict_visual_condition_shapes(
         self,
@@ -3333,12 +3361,13 @@ class MiniMaxH3Pipeline(
                     raise OmniClientError(
                         "MiniMax H3 diffusion stage requires text encoder conditioning when text_encoder is not loaded"
                     )
-                prepared = prepare_encoder_inputs(
-                    raw_prompt,
-                    sampling,
-                    task=task,
-                    prepared_reference_videos=self._extract_prepared_reference_videos(raw_prompt),
-                )
+                with h3_range("h3.encode.rank0_prepare_inputs"):
+                    prepared = prepare_encoder_inputs(
+                        raw_prompt,
+                        sampling,
+                        task=task,
+                        prepared_reference_videos=self._extract_prepared_reference_videos(raw_prompt),
+                    )
                 continuation = None
                 if prompts is not None or (request_context is not None and task == "ref2va"):
                     continuation = resolve_continuation(
@@ -3392,10 +3421,11 @@ class MiniMaxH3Pipeline(
                         }
             except Exception as exc:
                 error = exc
-        _broadcast_rank0_exception(error)
-        header = [(text_conditioning is not None, initial_noise_params, visual_noise_params)]
-        if world_size > 1:
-            dist.broadcast_object_list(header, src=0, group=group)
+        with h3_range("h3.encode.wait_rank0_prepare"):
+            _broadcast_rank0_exception(error)
+            header = [(text_conditioning is not None, initial_noise_params, visual_noise_params)]
+            if world_size > 1:
+                dist.broadcast_object_list(header, src=0, group=group)
         reuse_text, initial_noise_params, visual_noise_params = header[0]
         executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="minimax_h3_initial_noise")
@@ -3424,14 +3454,16 @@ class MiniMaxH3Pipeline(
                     text_conditioning.token_tags if rank == 0 else None, dtype=torch.long, device=self.device
                 )
             else:
-                hidden, tags = self.encode_prompt(prepared)
+                with h3_range("h3.encode.text"):
+                    hidden, tags = self.encode_prompt(prepared)
             window_text = None
             if prompts is not None:
                 window_text = [(hidden, tags)]
                 for index, prompt in enumerate(prompts[1:], start=2):
                     logger.info("MiniMax H3 encoding continuation prompt %d/%d", index, len(prompts))
                     window_text.append(self.encode_prompt(replace(prepared, prompt=prompt) if rank == 0 else None))
-            media = self._encode_local_media(prepared.media if prepared is not None else None)
+            with h3_range("h3.encode.media"):
+                media = self._encode_local_media(prepared.media if prepared is not None else None)
             if initial_noise is not None:
                 assert request_context is not None
                 request_context["precomputed_initial_noise"] = initial_noise.result()
@@ -3461,17 +3493,21 @@ class MiniMaxH3Pipeline(
         window_text = None
         context: dict[str, Any] = {}
         if self.load_text_encoder or self.load_vae_encoder:
-            conditioning, window_text = self._prepare_local_conditioning(
-                raw_prompt,
-                sampling,
-                require_external_text=not self.load_text_encoder,
-                request_context=context,
-            )
+            with h3_range("h3.encode.local_conditioning"):
+                conditioning, window_text = self._prepare_local_conditioning(
+                    raw_prompt,
+                    sampling,
+                    require_external_text=not self.load_text_encoder,
+                    request_context=context,
+                )
         else:
             conditioning = self._extract_encoder_conditioning(raw_prompt)
         prompt_media = raw_prompt.get("multi_modal_data") if isinstance(raw_prompt, Mapping) else None
         control_media = prompt_media.get(MINIMAX_H3_CONTROL_MEDIA_KEY) if isinstance(prompt_media, Mapping) else None
-        context.update(self._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=control_media))
+        with h3_range("h3.encode.conditioning_inputs"):
+            context.update(
+                self._prepare_encoder_conditioning_inputs(conditioning, sampling, control_media=control_media)
+            )
         if (
             context.get("latent_refine") is not None
             and context.get("latent_upscale") is not None
@@ -4225,10 +4261,11 @@ class MiniMaxH3Pipeline(
         if len(request.prompts) != 1:
             raise OmniClientError("MiniMax H3 supports one request at a time")
         check_request_cancellation()
-        context = self._prepare_request_inputs(
-            request.prompts[0],
-            request.sampling_params,
-        )
+        with h3_range("h3.encode"):
+            context = self._prepare_request_inputs(
+                request.prompts[0],
+                request.sampling_params,
+            )
         check_request_cancellation()
         denoise_kwargs = self._denoise_kwargs(context)
         num_outputs = context["num_outputs"]
@@ -4255,10 +4292,11 @@ class MiniMaxH3Pipeline(
                 # Open-H3-Regenerate starts from the encoded draft, not noise.
                 video_latent, audio_latent = regenerate_source
             elif context.get("continuation") is None and prefix is None:
-                video_latent, audio_latent = self.diffuse(
-                    **output_kwargs,
-                    request_context=context,
-                )
+                with h3_range("h3.diffuse"):
+                    video_latent, audio_latent = self.diffuse(
+                        **output_kwargs,
+                        request_context=context,
+                    )
             else:
                 # A continued request is one window behind its hidden prefix,
                 # or long-video windows whose first one starts behind it.
@@ -4290,7 +4328,8 @@ class MiniMaxH3Pipeline(
                     seed=output_seed,
                 )
             if cache_clip and upscale_target is None:
-                self._cache_clip_latents(context, video_latent, audio_latent)
+                with h3_range("h3.post.cache_clip_latents"):
+                    self._cache_clip_latents(context, video_latent, audio_latent)
             if context.get("regenerate_output_audio") is not None:
                 audio_latent = context["regenerate_output_audio"]
             if not self.load_vae_decoder:
@@ -4312,12 +4351,13 @@ class MiniMaxH3Pipeline(
                 )
                 audios.append(None)
             else:
-                video, audio = self.decode(
-                    video_latent,
-                    audio_latent,
-                    height=height,
-                    width=width,
-                )
+                with h3_range("h3.decode"):
+                    video, audio = self.decode(
+                        video_latent,
+                        audio_latent,
+                        height=height,
+                        width=width,
+                    )
                 if trim is not None:
                     # Decode keeps the real tail as causal context; return only new frames.
                     video, audio = trim_decoded_overlap(video, audio, **trim)
@@ -4326,13 +4366,15 @@ class MiniMaxH3Pipeline(
                 # rest of the iteration, and the next seed's diffuse() -- the DiT
                 # reload this release exists to make room for -- runs before the
                 # loop rebinds it. post_decode() rebinds for the same reason.
-                video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
+                with h3_range("h3.post.video_output"):
+                    video = self._offload_model_cpu_stage_output(_prepare_minimax_h3_video_output(video))
                 videos.append(video)
                 # The FP32 decoded frames are quantized into the appended uint8
                 # tensor; drop the reference and return the idle pages instead of
                 # holding them through the next output's denoise/decode.
                 del video
-                self._release_stage_cache()
+                with h3_range("h3.post.release_stage_cache"):
+                    self._release_stage_cache()
                 audios.append(audio)
         if not self.load_vae_decoder:
             return self._decoder_stage_output(
