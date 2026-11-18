@@ -140,3 +140,40 @@ def test_cpu_forward_never_requests_the_trim(monkeypatch):
     attention.forward(torch.zeros(3, 8), rope_table=torch.zeros(3, 96), cu_seqlens=None, max_seqlen=3)
     assert seen["groups"] == 0 and seen["ulysses_token_major_output"] is False
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("trim", "rope", "gate", "vdn", "expected"),
+    [
+        (True, True, False, False, 8),
+        # The switch at 0, no RoPE table, a VSA gate or a VDN branch keep the permute copies.
+        (False, True, False, False, 0),
+        (True, False, False, False, 0),
+        (True, True, True, False, 0),
+        (True, True, False, True, 0),
+    ],
+)
+def test_cuda_forward_requests_the_trim_on_the_plain_dense_path_only(monkeypatch, trim, rope, gate, vdn, expected):
+    monkeypatch.setattr(blocks, "_ULYSSES_PERMUTE_TRIM", trim)
+    monkeypatch.setattr(blocks, "_ulysses_send_head_groups", lambda layer, heads: 8)
+    attention = object.__new__(blocks.MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.num_heads, attention.head_dim = 2, 4
+    attention.attention = SimpleNamespace()
+    attention.to_gate_compress = (lambda x: torch.zeros(3, 8)) if gate else None
+    attention.vdn = SimpleNamespace(gate_softmax=lambda out, x: out, add_linear=lambda out, *a: out) if vdn else None
+    seen = {}
+
+    def project(x, rope_table, vdn_window, send_head_groups):
+        seen["groups"] = send_head_groups
+        q = torch.zeros(x.shape[0], 2, 4)
+        return q, q, q, q, q
+
+    attention._project_qkv = project
+    attention._run_packed_attention = lambda *args, **kwargs: seen.update(kwargs) or torch.zeros(3, 2, 4)
+    attention.out_proj = lambda out: (out[:, :1], None)
+    # Only shape and device are read before the (stubbed) projection.
+    x = SimpleNamespace(shape=(3, 8), is_cuda=True)
+    attention.forward(x, rope_table=torch.zeros(3, 96) if rope else None, cu_seqlens=None, max_seqlen=3)
+    assert seen["groups"] == expected
+    assert seen["ulysses_token_major_output"] is (expected > 0)
