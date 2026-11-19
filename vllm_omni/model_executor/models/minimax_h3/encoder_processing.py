@@ -1353,6 +1353,15 @@ def encode_media(
         if audio_vae is None:
             raise RuntimeError("MiniMax H3 audio WVAE is not resident on the encoder leader")
         early = [reference_audio.take(*item) if reference_audio is not None else None for item in audio_inputs]
+        if reference_audio is not None:
+            # Reused rows equal the serial encode, so this line is the only
+            # sign of whether the early encode took effect for this request.
+            logger.info(
+                "MiniMax H3 reference audio: %d of %d WVAE encodes reused from the early encode, %d left unused",
+                sum(encoded is not None for encoded in early),
+                len(early),
+                len(reference_audio),
+            )
         needs_audio_vae = media.audio_edit is not None or any(encoded is None for encoded in early)
         with component_scope(audio_vae) if needs_audio_vae else nullcontext():
             for (waveform, sample_rate), encoded in zip(audio_inputs, early, strict=True):

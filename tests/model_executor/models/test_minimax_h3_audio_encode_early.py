@@ -186,6 +186,43 @@ def test_encode_media_encodes_what_the_early_rows_miss():
     _assert_same_conditioning(early, serial)
 
 
+def _logged_reuse(monkeypatch) -> list[str]:
+    """vllm's logger does not propagate to caplog; record the reuse line directly."""
+    lines: list[str] = []
+    monkeypatch.setattr(processing.logger, "info", lambda message, *args: lines.append(message % args))
+    return lines
+
+
+@pytest.mark.parametrize(
+    ("encoded", "extra", "expected"),
+    [
+        (2, False, "2 of 2 WVAE encodes reused from the early encode, 0 left unused"),
+        (1, False, "1 of 2 WVAE encodes reused from the early encode, 0 left unused"),
+        (0, False, "0 of 2 WVAE encodes reused from the early encode, 0 left unused"),
+        # An early row no reference matches is left unused (and logged as such).
+        (2, True, "2 of 2 WVAE encodes reused from the early encode, 1 left unused"),
+    ],
+)
+def test_encode_media_logs_how_many_early_rows_it_reused(monkeypatch, encoded, extra, expected):
+    lines = _logged_reuse(monkeypatch)
+    media = _media()
+    vae = FakeAudioVAE()
+    encodings = processing.ReferenceAudioEncodings(vae)
+    encodings.encode(_audio_inputs(media)[:encoded])
+    if extra:
+        encodings.encode([(torch.ones(2, 16000), 16000)])
+    processing.encode_media(
+        media, video_vae=FakeVideoVAE(), audio_vae=vae, emit_conditioning=True, reference_audio=encodings
+    )
+    assert [line for line in lines if "reference audio:" in line] == [f"MiniMax H3 reference audio: {expected}"]
+
+
+def test_encode_media_logs_no_reuse_line_without_early_encodings(monkeypatch):
+    lines = _logged_reuse(monkeypatch)
+    processing.encode_media(_media(), video_vae=FakeVideoVAE(), audio_vae=FakeAudioVAE(), emit_conditioning=True)
+    assert not [line for line in lines if "reference audio:" in line]
+
+
 @pytest.fixture(scope="module")
 def sources(tmp_path_factory):
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:

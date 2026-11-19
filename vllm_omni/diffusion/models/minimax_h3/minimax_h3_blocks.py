@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -49,6 +50,8 @@ if TYPE_CHECKING:
 
     from .reference_kv_cache import MiniMaxH3ReferenceKVTier2State
 
+logger = init_logger(__name__)
+
 _BF16_DTYPE = torch.bfloat16
 _FP32_DTYPE = torch.float32
 
@@ -85,6 +88,29 @@ def _ulysses_permute_trim_enabled() -> bool:
 
 # Read once at import, which also rejects an invalid value up front.
 _ULYSSES_PERMUTE_TRIM = _ulysses_permute_trim_enabled()
+
+# Outcomes of a requested trim (True: the head-group kernel wrote the send
+# layout, False: it did not run) already logged by this process. Both paths
+# give the same output, so the log is the only sign of which one ran.
+_PERMUTE_TRIM_REPORTED: set[bool] = set()
+
+
+def _report_permute_trim(active: bool, head_groups: int) -> None:
+    """Log, once per process and outcome, whether a requested permute trim took effect."""
+    if active in _PERMUTE_TRIM_REPORTED:
+        return
+    _PERMUTE_TRIM_REPORTED.add(active)
+    if active:
+        logger.info(
+            "MiniMax-H3 strict-Ulysses permute trim active: Q/K written in the %d-way all-to-all send layout",
+            head_groups,
+        )
+    else:
+        logger.warning(
+            "MiniMax-H3 strict-Ulysses permute trim requested (%d-way) but the head-group Q/K kernel "
+            "does not run for this input; it keeps the Q/K permute copies",
+            head_groups,
+        )
 
 
 # Packed multi-request forwards require the attention backend to actually
@@ -554,6 +580,7 @@ class MiniMaxH3Attention(nn.Module):
                 self.q_norm.variance_epsilon,
                 send_head_groups,
             )
+            _report_permute_trim(send_qk is not None, send_head_groups)
         if send_qk is not None:
             q, k = (t.permute(1, 0, 2, 3) for t in send_qk)
         elif rope_table is None:

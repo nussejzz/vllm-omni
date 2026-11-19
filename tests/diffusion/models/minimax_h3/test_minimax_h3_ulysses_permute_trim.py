@@ -177,3 +177,52 @@ def test_cuda_forward_requests_the_trim_on_the_plain_dense_path_only(monkeypatch
     attention.forward(x, rope_table=torch.zeros(3, 96) if rope else None, cu_seqlens=None, max_seqlen=3)
     assert seen["groups"] == expected
     assert seen["ulysses_token_major_output"] is (expected > 0)
+
+
+def _projecting_attention(heads=4, head_dim=8):
+    attention = object.__new__(blocks.MiniMaxH3Attention)
+    torch.nn.Module.__init__(attention)
+    attention.num_heads = attention.num_kv_heads = heads
+    attention.head_dim = head_dim
+    attention.vdn = None
+    attention.qkv_proj = lambda x: (x.repeat(1, 3), None)
+    norm = SimpleNamespace(weight=torch.ones(head_dim), variance_epsilon=1e-6)
+    attention.q_norm = attention.k_norm = norm
+    return attention
+
+
+@pytest.mark.parametrize("kernel_runs", [True, False])
+def test_requested_trim_logs_its_outcome_once_per_process(monkeypatch, kernel_runs):
+    # vllm's logger does not propagate to caplog; record its calls directly.
+    logged = []
+    monkeypatch.setattr(blocks.logger, "info", lambda message, *args: logged.append(("info", message % args)))
+    monkeypatch.setattr(blocks.logger, "warning", lambda message, *args: logged.append(("warning", message % args)))
+    monkeypatch.setattr(blocks, "_PERMUTE_TRIM_REPORTED", set())
+
+    def head_groups(q, k, q_weight, k_weight, table, eps, groups):
+        if not kernel_runs:
+            return None
+        return tuple(t.unflatten(1, (groups, -1)).permute(1, 0, 2, 3).contiguous() for t in (q, k))
+
+    monkeypatch.setattr(blocks, "fused_qk_norm_rope_head_groups", head_groups)
+    monkeypatch.setattr(blocks, "fused_qk_norm_rope", lambda q, k, *args: (q, k))
+    attention = _projecting_attention()
+    x = torch.randn(3, 32)
+    for _ in range(3):
+        q, k, *_ = attention._project_qkv(x, torch.zeros(3, 4), None, 2)
+        assert q.shape == ((3, 2, 2, 8) if kernel_runs else (3, 4, 8))
+    # No trim requested: nothing is logged.
+    attention._project_qkv(x, torch.zeros(3, 4), None, 0)
+    if kernel_runs:
+        expected = [
+            ("info", "MiniMax-H3 strict-Ulysses permute trim active: Q/K written in the 2-way all-to-all send layout")
+        ]
+    else:
+        expected = [
+            (
+                "warning",
+                "MiniMax-H3 strict-Ulysses permute trim requested (2-way) but the head-group Q/K kernel "
+                "does not run for this input; it keeps the Q/K permute copies",
+            )
+        ]
+    assert logged == expected
