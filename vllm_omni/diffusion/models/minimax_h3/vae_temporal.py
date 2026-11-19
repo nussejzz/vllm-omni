@@ -19,9 +19,10 @@ at adapter construction:
   delivered video is bit-identical while the resident decode buffer shrinks
   4x.
 
-Both forks schedule the spatial tiles of all their temporal clips at once
-when the checkpoint tiles in parallel (``vae_global_tiles``; roll back with
-``VLLM_OMNI_H3_VAE_GLOBAL_TILES=0``).
+Both forks can schedule the spatial tiles of all their temporal clips at
+once when the checkpoint tiles in parallel (``vae_global_tiles``; off by
+default, opt in with ``VLLM_OMNI_H3_VAE_GLOBAL_TILES=1`` or per-rank
+weights).
 
 Set ``VLLM_OMNI_VAE_LEGACY_TEMPORAL=1`` to keep the checkpoint's methods.
 

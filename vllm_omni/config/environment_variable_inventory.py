@@ -282,8 +282,9 @@ _MODEL_INTERNALIZE = (
     # MiniMax-H3: transitional rollback/A-B switch for the fused video VAE
     # encoder input chain (0 = checkpoint encoder forwards).
     "VLLM_OMNI_H3_VAE_ENCODER_FUSION",
-    # MiniMax-H3: transitional rollback/A-B switch for the cross-clip VAE tile
-    # schedule (0 = one tile schedule and gather per temporal clip).
+    # MiniMax-H3: transitional opt-in/A-B switch for the cross-clip VAE tile
+    # schedule (unset/0 = one tile schedule and gather per temporal clip;
+    # 1 or per-rank weights = one schedule across all clips).
     "VLLM_OMNI_H3_VAE_GLOBAL_TILES",
     # MiniMax-H3: transitional rollback/A-B switch for the strict-Ulysses Q/K/O
     # permute trim (0 = permute copies before every all-to-all).

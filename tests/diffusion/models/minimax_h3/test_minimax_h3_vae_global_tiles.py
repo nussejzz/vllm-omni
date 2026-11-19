@@ -7,8 +7,9 @@
 (``split_tiles``, ``blend``, ``tiled_encode``/``tiled_decode``, the
 round-robin task split and the variable-shape gather, minus training-only
 branches) around a cheap deterministic encoder/decoder. Four gloo ranks run
-the forks with the per-clip schedule (``VLLM_OMNI_H3_VAE_GLOBAL_TILES=0``)
-and with the global one, round-robin and weighted: moments and uint8
+the forks with the per-clip schedule (``VLLM_OMNI_H3_VAE_GLOBAL_TILES=0``,
+and the same unset, its default) and with the global one, round-robin
+(``1``) and weighted: moments and uint8
 frames must match bit for bit, the global schedule must not take the
 per-clip gather at all, and each rank must run exactly its share.
 """
@@ -297,7 +298,10 @@ def _latent(tokens, height=6, width=10):
 
 
 def _run(model, mode, fn):
-    os.environ[ENV] = mode
+    if mode is None:
+        os.environ.pop(ENV, None)  # unset: the per-clip schedule
+    else:
+        os.environ[ENV] = mode
     model.encode_calls = model.decode_calls = model.gathers = 0
     out = fn()
     return out, (model.encode_calls, model.decode_calls, model.gathers)
@@ -317,6 +321,8 @@ def _global_tiles_worker(rank, rendezvous):
         model = _TiledModel()
         x = _video(11)
         old, old_counts = _run(model, "0", lambda: _encode_temporal_tail_pad(model, x))
+        unset, unset_counts = _run(model, None, lambda: _encode_temporal_tail_pad(model, x))
+        assert torch.equal(unset, old) and unset_counts == old_counts
         new, new_counts = _run(model, "1", lambda: _encode_temporal_tail_pad(model, x))
         assert new.shape == old.shape and torch.equal(new, old)
         assert old_counts == (4 * per_clip_share, 0, 4)
@@ -344,6 +350,8 @@ def _global_tiles_worker(rank, rendezvous):
                 return _decode_temporal_streaming_uint8(model, z, None, None, 3, 0, temporal_cat_dtype)
 
             old, old_counts = _run(model, "0", decode)
+            unset, unset_counts = _run(model, None, decode)
+            assert torch.equal(unset, old) and unset_counts == old_counts
             new, new_counts = _run(model, "1", decode)
             assert old.dtype == torch.uint8 and new.shape == old.shape and torch.equal(new, old)
             assert old_counts == (0, 3 * per_clip_share, 3)
@@ -428,11 +436,23 @@ def test_weighted_owners_cover_every_tile_and_rank(weights, num_tiles):
 def test_switch_values():
     parse = global_tiles._parse_global_tiles
     assert parse("0") == (False, None) and parse("off") == (False, None)
-    assert parse("") == (True, None) and parse("1") == (True, None)
+    assert parse("") == (False, None) and parse("  ") == (False, None)
+    assert parse("1") == (True, None) and parse("on") == (True, None)
     assert parse(" 1,1,0.83 ") == (True, (1.0, 1.0, 0.83))
     for bad in ("fast", "1,,1", "1,0", "1,-2", "nan,1"):
         with pytest.raises(ValueError, match=ENV):
             parse(bad)
+
+
+def test_switch_is_off_when_unset(monkeypatch):
+    monkeypatch.delenv(ENV, raising=False)
+    assert global_tiles.vae_global_tiles_enabled() is False
+    assert global_tiles._global_tile_weights(8) is None
+    monkeypatch.setenv(ENV, "")
+    assert global_tiles.vae_global_tiles_enabled() is False
+    for value in ("1", "1,1,0.83"):
+        monkeypatch.setenv(ENV, value)
+        assert global_tiles.vae_global_tiles_enabled() is True
 
 
 def test_weights_for_another_group_size_fall_back_to_equal_shares(monkeypatch):
@@ -452,10 +472,11 @@ def parallel_state():
 @pytest.mark.parametrize("decoder", [False, True])
 def test_switch_and_configuration_gate_the_schedule(monkeypatch, parallel_state, decoder):
     monkeypatch.delenv(ENV, raising=False)
-    assert global_tiles.global_tile_state(_TiledModel(), decoder=decoder) is parallel_state
+    assert global_tiles.global_tile_state(_TiledModel(), decoder=decoder) is None
     monkeypatch.setenv(ENV, "0")
     assert global_tiles.global_tile_state(_TiledModel(), decoder=decoder) is None
     monkeypatch.setenv(ENV, "1")
+    assert global_tiles.global_tile_state(_TiledModel(), decoder=decoder) is parallel_state
 
     def declined(**attrs):
         model = _TiledModel()
@@ -474,7 +495,8 @@ def test_switch_and_configuration_gate_the_schedule(monkeypatch, parallel_state,
     assert declined()
 
 
-def test_encoder_cls_token_aggregation_keeps_per_clip_schedule(parallel_state):
+def test_encoder_cls_token_aggregation_keeps_per_clip_schedule(monkeypatch, parallel_state):
+    monkeypatch.setenv(ENV, "1")
     model = _TiledModel()
     model.encoder = type("Encoder", (), {"loss_info": {}})()
     assert global_tiles.global_tile_state(model, decoder=False) is None

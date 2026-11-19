@@ -35,15 +35,24 @@ clips or tiles of differing shapes, encoder/decoder sequence parallelism,
 cls-token aggregation, a gather routed through an adapter workspace) keeps
 the per-clip schedule.
 
-``VLLM_OMNI_H3_VAE_GLOBAL_TILES`` selects the schedule: ``0`` keeps the
-per-clip schedule, unset or ``1`` hands the global list out round-robin, and
-a comma-separated list of positive per-rank weights (one per tile-group
-rank, e.g. ``1,1,1,1,1,0.83,1,1``) hands rank ``r`` a share of the tiles
-proportional to its weight. Weights exist for groups whose GPUs are not
-equally fast: a rank whose clock is capped would otherwise set the pace of
-the whole round-robin. They move tiles between ranks only; a tile runs the
-same kernels on whichever rank owns it, so on identical GPUs the output does
-not depend on them.
+``VLLM_OMNI_H3_VAE_GLOBAL_TILES`` selects the schedule and is off by
+default: unset, empty or ``0`` keeps the per-clip schedule, ``1`` hands the
+global list out round-robin, and a comma-separated list of positive per-rank
+weights (one per tile-group rank, e.g. ``1,1,1,1,1,0.83,1,1``) hands rank
+``r`` a share of the tiles proportional to its weight. Weights exist for
+groups whose GPUs are not equally fast: a rank whose clock is capped would
+otherwise set the pace of the whole round-robin. They move tiles between
+ranks only; a tile runs the same kernels on whichever rank owns it, so on
+identical GPUs the output does not depend on them.
+
+The schedule is opt-in because it did not pay off end to end. On 8xH200 USP8
+with the response MP4 encoded during the decode (``stream_mp4``), dropping
+it made the warm sheep Ref2VA / 9i1v requests 0.11 / 0.03 s faster, and the
+equal split was 0.20 / 0.38 s slower than the weighted one; its only gain
+came from weighting around one clock-capped GPU, which is a property of the
+node, not of the model. Finishing every clip at about the same time
+probably also leaves the streaming MP4 encode nothing to overlap with during
+the decode.
 """
 
 from __future__ import annotations
@@ -66,9 +75,9 @@ MINIMAX_H3_VAE_GLOBAL_TILES_ENV = "VLLM_OMNI_H3_VAE_GLOBAL_TILES"
 def _parse_global_tiles(value: str) -> tuple[bool, tuple[float, ...] | None]:
     """``(enabled, per-rank weights or None)`` for one value of the switch."""
     value = value.strip().lower()
-    if value in ("0", "false", "off", "no"):
+    if value in ("", "0", "false", "off", "no"):
         return False, None
-    if value in ("", "1", "true", "on", "yes"):
+    if value in ("1", "true", "on", "yes"):
         return True, None
     try:
         weights = tuple(float(item) for item in value.split(","))
@@ -76,24 +85,24 @@ def _parse_global_tiles(value: str) -> tuple[bool, tuple[float, ...] | None]:
         weights = ()
     if not weights or not all(math.isfinite(w) and w > 0 for w in weights):
         raise ValueError(
-            f"{MINIMAX_H3_VAE_GLOBAL_TILES_ENV} must be 0, 1, or comma-separated positive per-rank weights, "
-            f"got {value!r}"
+            f"{MINIMAX_H3_VAE_GLOBAL_TILES_ENV} must be unset, 0, 1, or comma-separated positive per-rank "
+            f"weights, got {value!r}"
         )
     return True, weights
 
 
 def vae_global_tiles_enabled() -> bool:
-    """Whether the cross-clip tile schedule is on (default) or rolled back (``0``)."""
-    return _parse_global_tiles(os.environ.get(MINIMAX_H3_VAE_GLOBAL_TILES_ENV, "1"))[0]
+    """Whether the cross-clip tile schedule is opted into (``1`` or weights); off when unset or ``0``."""
+    return _parse_global_tiles(os.environ.get(MINIMAX_H3_VAE_GLOBAL_TILES_ENV, ""))[0]
 
 
 # Reject a malformed switch when the model is imported rather than at the
 # first request; requests still read it, so it can change between them.
-_parse_global_tiles(os.environ.get(MINIMAX_H3_VAE_GLOBAL_TILES_ENV, "1"))
+_parse_global_tiles(os.environ.get(MINIMAX_H3_VAE_GLOBAL_TILES_ENV, ""))
 
 
 def _global_tile_weights(sp_size: int) -> tuple[float, ...] | None:
-    weights = _parse_global_tiles(os.environ.get(MINIMAX_H3_VAE_GLOBAL_TILES_ENV, "1"))[1]
+    weights = _parse_global_tiles(os.environ.get(MINIMAX_H3_VAE_GLOBAL_TILES_ENV, ""))[1]
     if weights is not None and len(weights) != sp_size:
         logger.warning_once(
             "%s lists %d rank weights but the VAE tile group has %d ranks; using equal shares",
