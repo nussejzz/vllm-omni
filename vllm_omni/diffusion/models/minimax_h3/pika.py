@@ -8,6 +8,9 @@ Sampling / noise convention: Pika-Labs/Pika-H3-Flex at f961d7e (Apache-2.0),
 ``src/pika_h3/core/{sampling.py,wrapper.py,evaluation.py,schedules.py}``.
 Ported from the Pika part of vllm-project/vllm-omni draft PR #9777 (head 72bc945)
 onto the request-local sampler framework of ``vllm_omni.diffusion.sampler``.
+Served adapters: ``ref2va/`` (Ref2VA trunk, ``--task-type ref2va``) and ``fl2va/``
+(FL2VA trunk, ``--task-type fl2va``; t2va requests only, see ``PIKA_REQUEST_TASKS``).
+Both use the same sampler, ladders and noise streams below.
 
 Contract summary (``pika-flex-noise-v1``):
 
@@ -61,8 +64,15 @@ PIKA_CORRELATED_SEED_OFFSETS = (
 # Visual reference rows are noised to t=0.999 (``H3DiffusionWrapper._noise_condition_rows``).
 PIKA_CONDITION_NOISE_AUG = 0.999
 PIKA_NUMERICS_POLICY = {"ref2va": "fp32_conditioning_v1", "fl2va": "bf16_conditioning_v1"}
-# FL2VA (bf16 conditioning, crop-fit keyframes) is not ported yet.
-PIKA_SERVED_TASKS = frozenset({"ref2va"})
+# Request tasks each released adapter serves here. The fl2va adapter (FL2VA
+# trunk) covers Pika's t2va / i2va / l2va / fl2va; only text-to-video-and-audio
+# is ported: Pika's keyframe conditioning (source center-crop + LANCZOS
+# keyframes, bf16-rounded keyframe anchors noised from the augmentation stream)
+# is not, so H3's own keyframe path is rejected rather than served under the
+# Pika contract. A t2va request has no visual condition, so the adapter's
+# bf16_conditioning_v1 policy only fixes the (already bf16) prompt embeddings.
+PIKA_REQUEST_TASKS = {"ref2va": frozenset({"ref2va"}), "fl2va": frozenset({"t2va"})}
+PIKA_SERVED_TASKS = frozenset(PIKA_REQUEST_TASKS)
 
 
 def pika_sigmas(shift: float) -> list[float]:
@@ -95,6 +105,11 @@ class PikaSpec:
         return torch.float32 if self.numerics_policy == "fp32_conditioning_v1" else torch.bfloat16
 
     @property
+    def request_tasks(self) -> frozenset[str]:
+        """The request tasks this adapter serves (``ref2va``; ``t2va`` for the fl2va adapter)."""
+        return PIKA_REQUEST_TASKS.get(self.task, frozenset({self.task}))
+
+    @property
     def base_schedule(self) -> tuple[float, ...]:
         return tuple(knot / 1000 for knot in PIKA_KNOTS)
 
@@ -111,7 +126,12 @@ class PikaSpec:
 
         Raises ``ValueError``; the pipeline turns it into a client error.
         """
-        if task != self.task:
+        if task not in self.request_tasks:
+            if self.task == "fl2va" and task == "fl2va":
+                raise ValueError(
+                    f"{self.name} fl2va adapter: first/last-frame conditioning (Pika i2va / l2va / fl2va) is not "
+                    "ported to vLLM-Omni yet; send task=t2va without images"
+                )
             raise ValueError(f"{self.name} {self.task} adapter cannot serve task={task}")
         steps = getattr(sampling, "num_inference_steps", None)
         if steps is not None and int(steps) != self.denoise_steps:
@@ -426,6 +446,7 @@ __all__ = [
     "PIKA_KNOTS",
     "PIKA_NOISE_VERSION",
     "PIKA_RENOISE_SEED_OFFSET",
+    "PIKA_REQUEST_TASKS",
     "PIKA_SERVED_TASKS",
     "PIKA_VIDEO_SHIFT",
     "PikaDebugDump",

@@ -219,41 +219,41 @@ def _sampling(**overrides):
     return OmniDiffusionSamplingParams(**{"num_inference_steps": None, "extra_args": {}, **overrides})
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"num_inference_steps": 7},
-        {"num_inference_steps": 50},
-        {"extra_args": {"flow_shift": 6}},
-        {"extra_args": {"audio_flow_shift": float("nan")}},
-        {"extra_args": {"audio_flow_shift": "x"}},
-        {"extra_args": {"long_video_mode": "continuation"}},
-        {"extra_args": {"continuation_prompts": ["a", "b"]}},
-        {"extra_args": {"audio_mode": "lock_source"}},
-        {"extra_args": {"sampler": "res_multistep"}},
-        {"extra_args": {"continue_from": "clip-123"}},
-        {"extra_args": {"regenerate": True}},
-        {"quality": "high"},
-        {"lora_request": LoRARequest("other", 3, "/unused")},
-        {"num_outputs_per_prompt": 2},
-        {"num_outputs_per_prompt": 10},
-    ],
-)
+_REJECTED_OVERRIDES = [
+    {"num_inference_steps": 7},
+    {"num_inference_steps": 50},
+    {"extra_args": {"flow_shift": 6}},
+    {"extra_args": {"audio_flow_shift": float("nan")}},
+    {"extra_args": {"audio_flow_shift": "x"}},
+    {"extra_args": {"long_video_mode": "continuation"}},
+    {"extra_args": {"continuation_prompts": ["a", "b"]}},
+    {"extra_args": {"audio_mode": "lock_source"}},
+    {"extra_args": {"sampler": "res_multistep"}},
+    {"extra_args": {"continue_from": "clip-123"}},
+    {"extra_args": {"regenerate": True}},
+    {"quality": "high"},
+    {"lora_request": LoRARequest("other", 3, "/unused")},
+    {"num_outputs_per_prompt": 2},
+    {"num_outputs_per_prompt": 10},
+]
+
+
+@pytest.mark.parametrize("overrides", _REJECTED_OVERRIDES)
 def test_pika_request_cannot_silently_change_sampling(overrides):
     with pytest.raises(ValueError):
         _spec().check_request(_sampling(**overrides), "ref2va")
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {},
-        {"num_inference_steps": 6},
-        {"extra_args": {"flow_shift": "12", "audio_flow_shift": 3}},
-        {"quality": "lossless"},
-        {"num_outputs_per_prompt": 1},
-    ],
-)
+_ACCEPTED_OVERRIDES = [
+    {},
+    {"num_inference_steps": 6},
+    {"extra_args": {"flow_shift": "12", "audio_flow_shift": 3}},
+    {"quality": "lossless"},
+    {"num_outputs_per_prompt": 1},
+]
+
+
+@pytest.mark.parametrize("overrides", _ACCEPTED_OVERRIDES)
 def test_pika_request_accepts_its_own_contract(overrides):
     _spec().check_request(_sampling(**overrides), "ref2va")
 
@@ -831,3 +831,163 @@ def test_pika_image_encode_policy_allows_cudnn_tf32():
             assert torch.backends.cudnn.allow_tf32 is False  # CPU: untouched
     finally:
         torch.backends.cudnn.allow_tf32, torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = saved
+
+
+# ---------------------------------------------------------------- fl2va adapter (t2va requests)
+
+
+def test_pika_request_tasks_per_adapter():
+    from vllm_omni.diffusion.models.minimax_h3.pika import PIKA_REQUEST_TASKS, PIKA_SERVED_TASKS
+
+    assert PIKA_SERVED_TASKS == frozenset({"ref2va", "fl2va"})
+    assert PIKA_REQUEST_TASKS == {"ref2va": frozenset({"ref2va"}), "fl2va": frozenset({"t2va"})}
+    assert _spec("ref2va").request_tasks == frozenset({"ref2va"})
+    assert _spec("fl2va").request_tasks == frozenset({"t2va"})
+
+
+def test_pika_fl2va_adapter_serves_t2va_and_rejects_keyframes():
+    spec = _spec("fl2va")
+    spec.check_request(_sampling(), "t2va")
+    spec.check_request(_sampling(num_inference_steps=6), "t2va", step_execution=True)
+    with pytest.raises(ValueError, match="explicit"):
+        spec.check_request(_sampling(), "t2va", step_execution=True)
+    with pytest.raises(ValueError, match="not ported"):
+        spec.check_request(_sampling(), "fl2va")  # H3 first/last-frame keyframes
+    with pytest.raises(ValueError, match="fl2va adapter cannot serve task=ref2va"):
+        spec.check_request(_sampling(), "ref2va")
+    # The ref2va adapter keeps its exact behaviour and message.
+    for task in ("t2va", "fl2va"):
+        with pytest.raises(ValueError, match=f"ref2va adapter cannot serve task={task}$"):
+            _spec().check_request(_sampling(), task)
+
+
+@pytest.mark.parametrize("overrides", _REJECTED_OVERRIDES)
+def test_pika_fl2va_request_cannot_silently_change_sampling(overrides):
+    with pytest.raises(ValueError):
+        _spec("fl2va").check_request(_sampling(**overrides), "t2va")
+
+
+@pytest.mark.parametrize("overrides", _ACCEPTED_OVERRIDES)
+def test_pika_fl2va_request_accepts_its_own_contract(overrides):
+    _spec("fl2va").check_request(_sampling(**overrides), "t2va")
+
+
+def test_pika_fl2va_pipeline_request_validation():
+    pipe = object.__new__(pipeline_module.MiniMaxH3Pipeline)
+    pipe.od_config = OmniDiffusionConfig()
+    pipe._fasth3 = None
+    pipe._pika_spec = _spec("fl2va")
+    positions, steps = pipe._resolve_sigma_positions("t2va", _sampling(num_inference_steps=50))
+    assert steps == 6 and positions == (1.0, 0.75, 0.5, 0.25, 0.1, 0.04, 0.0)
+    assert pipe._validate_pika_request(_sampling(), "t2va") is pipe._pika_spec
+    with pytest.raises(OmniClientError, match="not ported"):
+        pipe._validate_pika_request(_sampling(), "fl2va")
+    with pytest.raises(OmniClientError, match="num_inference_steps"):
+        pipe._validate_pika_request(_sampling(num_inference_steps=50), "t2va")
+
+
+def test_pika_fl2va_startup_claims_the_fl2va_partition_only(tmp_path):
+    _artifact(tmp_path, task="fl2va")
+    previous = torch.backends.cuda.matmul.allow_tf32
+    try:
+        pipe = _startup_pipe("fl2va")
+        spec = pipe._resolve_startup_pika(SimpleNamespace(lora_path=str(tmp_path), lora_scale=1.0), modular=False)
+        assert spec is not None and spec.task == "fl2va" and spec.release_id == "pika-flex-fl2va-v1"
+        assert spec.numerics_policy == "bf16_conditioning_v1" and spec.conditioning_dtype == torch.bfloat16
+        assert spec.request_tasks == frozenset({"t2va"})
+        assert pipe.diffusion_lora_fixed_adapter is True
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        for partition in ("ref2va", "combined"):
+            with pytest.raises(ValueError, match="task-type fl2va"):
+                _startup_pipe(partition)._resolve_startup_pika(SimpleNamespace(lora_path=str(tmp_path)), modular=False)
+        with pytest.raises(ValueError, match="original"):
+            _startup_pipe("fl2va")._resolve_startup_pika(SimpleNamespace(lora_path=str(tmp_path)), modular=True)
+        with pytest.raises(ValueError, match="original"):
+            _startup_pipe("fl2va", base_schedule=object())._resolve_startup_pika(
+                SimpleNamespace(lora_path=str(tmp_path)), modular=False
+            )
+        with pytest.raises(ValueError, match="cache-backend none"):
+            _startup_pipe("fl2va")._resolve_startup_pika(
+                SimpleNamespace(lora_path=str(tmp_path), cache_backend="cache_dit"), modular=False
+            )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+def test_pika_fl2va_adapter_loads_only_on_the_fl2va_partition(tmp_path, monkeypatch):
+    monkeypatch.setattr(lora_module, "_TURBO_TARGET_DIMS", _TINY_TARGET_DIMS)
+    path = _artifact(tmp_path, task="fl2va")
+    with pytest.raises(ValueError, match="dedicated"):
+        _load(path, "ref2va")
+    pipe = _startup_pipe("fl2va")
+    pipe._turbo_lora_specs, pipe._native_distilled_lora_adapter_ids, pipe._lora_sigma_schedules = {}, set(), {}
+    pipe._pika_lora_specs = {}
+    pipe._pika_spec = read_pika_spec(path)
+    request = LoRARequest("pika", 7, str(tmp_path))
+    model, _ = pipe._load_diffusion_lora_adapter(lora_request=request, lora_path=str(tmp_path), dtype=torch.bfloat16)
+    assert pipe._pika_lora_specs[7] == pipe._pika_spec and pipe._pika_spec.task == "fl2va"
+    pipe._validate_diffusion_lora_binding(lora_model=model, bound_lora_names=frozenset(model.loras))
+
+
+def test_pika_t2va_request_preparation_and_six_step_renoise_loop():
+    """t2va under the fl2va adapter: no visual anchor, Pika's device noise, ladders and re-noise loop."""
+    model = _RecordingModel()
+    pipe = _step_pipeline(model)
+    spec = _spec("fl2va")
+    inputs = pipe._build_denoise_inputs(
+        task="t2va",
+        text_embeddings=torch.ones(3, 8),
+        text_tags=torch.ones(3, dtype=torch.long),
+        seed=42,
+        latent_t=2,
+        latent_h=4,
+        latent_w=6,
+        audio_t=3,
+        num_frames=22,
+        num_steps=6,
+        video_shift=12.0,
+        audio_shift=3.0,
+        base_schedule=spec.base_schedule,
+        visual_condition=None,
+        visual_condition_shape=None,
+        audio_condition=None,
+        ref_audio_t=None,
+        pika=spec,
+        # The base runtime can prepare CPU noise ahead of encoding; Pika ignores it.
+        precomputed_initial_noise=(torch.zeros(12, 96), torch.zeros(6, 32)),
+    )
+    branch = inputs["branch"]
+    assert inputs["cond_anchor"] is None and inputs["audio_anchor"] is None
+    assert bool(branch.update_mask.all()) and bool(branch.audio_update_mask.all())
+    initial_video, initial_audio = _noise().initial_rows()
+    torch.testing.assert_close(inputs["video_rows"], initial_video, rtol=0, atol=0)
+    torch.testing.assert_close(inputs["audio_rows"], initial_audio, rtol=0, atol=0)
+    assert inputs["sigmas_video"] == pika_sigmas(12.0) and inputs["sigmas_audio"] == pika_sigmas(3.0)
+    assert inputs["sampler"] == RENOISE_SAMPLER and isinstance(inputs["noise_source"], PikaNoise)
+    out_video, out_audio = minimax_h3_denoise_loop(
+        model=model,
+        positive=branch,
+        initial_video_rows=inputs["video_rows"],
+        initial_audio_rows=inputs["audio_rows"],
+        keyframe_cond_rows=inputs["cond_anchor"],
+        audio_ref_rows=inputs["audio_anchor"],
+        sigmas_video=inputs["sigmas_video"],
+        sigmas_audio=inputs["sigmas_audio"],
+        device=torch.device("cpu"),
+        sampler=inputs["sampler"],
+        noise_source=inputs["noise_source"],
+    )
+    assert len(model.calls) == 6
+    reference = _noise()
+    sv, sa = pika_sigmas(12.0), pika_sigmas(3.0)
+    rows_v, rows_a = initial_video.clone(), initial_audio.clone()
+    for i, call in enumerate(model.calls):
+        torch.testing.assert_close(call["video_rows"], rows_v, rtol=0, atol=0)
+        torch.testing.assert_close(call["audio_rows"], rows_a, rtol=0, atol=0)
+        x0_v = rows_v + sv[i] * call["video_out"].float()
+        x0_a = rows_a + sa[i] * call["audio_out"].float()
+        eps = reference.draw(i, (x0_v if sv[i + 1] else None, x0_a if sa[i + 1] else None))
+        rows_v = renoise_step(x0_v, eps[0], sigma_next=sv[i + 1])
+        rows_a = renoise_step(x0_a, eps[1], sigma_next=sa[i + 1])
+    torch.testing.assert_close(out_video, rows_v, rtol=0, atol=0)
+    torch.testing.assert_close(out_audio, rows_a, rtol=0, atol=0)

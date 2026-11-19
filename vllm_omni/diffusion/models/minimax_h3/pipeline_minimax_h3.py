@@ -1057,7 +1057,7 @@ class MiniMaxH3Pipeline(
         if spec is None:
             return None
         if spec.task not in PIKA_SERVED_TASKS:
-            raise ValueError(f"Pika H3 Flex {spec.task} is not ported to vLLM-Omni yet; serve the ref2va adapter")
+            raise ValueError(f"Pika H3 Flex {spec.task} is not ported to vLLM-Omni yet")
         if self.partition != spec.task:
             raise ValueError(
                 f"Pika H3 Flex {spec.task} requires --task-type {spec.task}, got partition {self.partition!r}"
@@ -3775,8 +3775,8 @@ class MiniMaxH3Pipeline(
             or conditioning.audio_edit_clean_rows is not None
         ):
             raise OmniClientError(
-                f"{pika.name} supports plain Ref2VA requests only: no control, continuation, timeline guides "
-                "or latent-mask editing"
+                f"{pika.name} supports plain {'Ref2VA' if pika.task == 'ref2va' else 'T2VA'} requests only: "
+                "no control, continuation, timeline guides or latent-mask editing"
             )
         if self._fasth3_checkpoint is not None:
             self._fasth3_checkpoint.check_request(
