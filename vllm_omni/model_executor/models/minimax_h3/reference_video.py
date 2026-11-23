@@ -188,7 +188,13 @@ def _probe_video(path: str) -> dict[str, Any]:
     }
 
 
-def _validate_reference_video_metadata(meta: dict[str, Any], *, index: int, source: str) -> None:
+def _validate_reference_video_metadata(
+    meta: dict[str, Any],
+    *,
+    index: int,
+    source: str,
+    max_duration: float = MINIMAX_H3_MAX_REFERENCE_DURATION,
+) -> None:
     width = int(meta["width"])
     height = int(meta["height"])
     if (
@@ -204,11 +210,10 @@ def _validate_reference_video_metadata(meta: dict[str, Any], *, index: int, sour
     if not MINIMAX_H3_MIN_REFERENCE_FPS <= fps <= MINIMAX_H3_MAX_REFERENCE_FPS:
         raise OmniClientError(f"reference video {index} FPS must be in [23.976, 60], got {fps:.3f}")
     duration = float(meta["duration"])
-    if (
-        not math.isfinite(duration)
-        or not MINIMAX_H3_MIN_REFERENCE_DURATION <= duration <= MINIMAX_H3_MAX_REFERENCE_DURATION
-    ):
-        raise OmniClientError(f"reference video {index} duration must be in [2, 15] seconds, got {duration:.3f}")
+    if not math.isfinite(duration) or not MINIMAX_H3_MIN_REFERENCE_DURATION <= duration <= max_duration:
+        raise OmniClientError(
+            f"reference video {index} duration must be in [2, {max_duration:g}] seconds, got {duration:.3f}"
+        )
 
     raw_file_size = meta.get("file_size")
     file_size = int(raw_file_size) if raw_file_size is not None else os.path.getsize(source)
@@ -320,7 +325,11 @@ def _validate_reference_audio_metadata(meta: dict[str, Any], *, index: int) -> f
     return duration
 
 
-def validate_reference_audio_waveforms(values: list[tuple[torch.Tensor, int]]) -> None:
+def validate_reference_audio_waveforms(
+    values: list[tuple[torch.Tensor, int]],
+    *,
+    max_seconds: float = MINIMAX_H3_MAX_REFERENCE_TOTAL_DURATION,
+) -> None:
     """Validate in-memory standalone audio references using sample counts."""
     total_duration = 0.0
     for index, (waveform, sample_rate) in enumerate(values):
@@ -328,11 +337,13 @@ def validate_reference_audio_waveforms(values: list[tuple[torch.Tensor, int]]) -
             raise OmniClientError(f"reference audio {index} has an invalid sample rate")
         samples = int(waveform.shape[-1])
         duration = samples / int(sample_rate)
-        if not MINIMAX_H3_MIN_REFERENCE_DURATION <= duration <= MINIMAX_H3_MAX_REFERENCE_DURATION:
-            raise OmniClientError(f"reference audio {index} duration must be in [2, 15] seconds, got {duration:.3f}")
+        if not MINIMAX_H3_MIN_REFERENCE_DURATION <= duration <= max_seconds:
+            raise OmniClientError(
+                f"reference audio {index} duration must be in [2, {max_seconds:g}] seconds, got {duration:.3f}"
+            )
         total_duration += duration
-    if total_duration > MINIMAX_H3_MAX_REFERENCE_TOTAL_DURATION:
-        raise OmniClientError("reference audio must be at most 15 seconds in total")
+    if total_duration > max_seconds:
+        raise OmniClientError(f"reference audio must be at most {max_seconds:g} seconds in total")
 
 
 def _reference_video_shape(width: int, height: int) -> tuple[int, int]:
@@ -872,6 +883,7 @@ def prepare_reference_videos(
     start_time_seconds: Any = None,
     decode_frames: bool = False,
     frame_workers: int = 1,
+    max_total_seconds: float = MINIMAX_H3_MAX_REFERENCE_TOTAL_DURATION,
 ) -> list[dict[str, Any]]:
     """Validate the Ref2VA reference videos, then prepare their frames.
 
@@ -906,7 +918,7 @@ def prepare_reference_videos(
             )
         source = str(value)
         meta = _probe_video(source)
-        _validate_reference_video_metadata(meta, index=index, source=source)
+        _validate_reference_video_metadata(meta, index=index, source=source, max_duration=max_total_seconds)
         start = 0.0 if item_start is None else float(item_start)
         if not math.isfinite(start) or start < 0 or start >= float(meta["duration"]):
             raise OmniClientError(f"reference video {index} start_time_seconds is outside the source duration")
@@ -915,13 +927,13 @@ def prepare_reference_videos(
             raise OmniClientError(
                 f"reference video {index} must provide at least 2 seconds after start_time_seconds, got {duration:.3f}"
             )
-        remaining_duration = MINIMAX_H3_MAX_REFERENCE_TOTAL_DURATION - total_duration
+        remaining_duration = max_total_seconds - total_duration
         if duration > remaining_duration:
             if duration - remaining_duration > MINIMAX_H3_REFERENCE_DURATION_EPSILON:
-                raise OmniClientError("reference videos must be at most 15 seconds in total")
+                raise OmniClientError(f"reference videos must be at most {max_total_seconds:g} seconds in total")
             duration = remaining_duration
             if duration < MINIMAX_H3_MIN_REFERENCE_DURATION:
-                raise OmniClientError("reference videos must be at most 15 seconds in total")
+                raise OmniClientError(f"reference videos must be at most {max_total_seconds:g} seconds in total")
         total_duration += duration
         width, height = _reference_video_shape(meta["width"], meta["height"])
         segments.append((source, meta, start, duration, width, height))

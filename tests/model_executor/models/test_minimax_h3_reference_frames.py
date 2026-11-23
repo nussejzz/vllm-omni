@@ -721,3 +721,53 @@ def test_unconsumed_frame_jobs_are_cancelled_on_error(monkeypatch, sources, refe
     assert [job.workers for job in jobs] == [1, 1]
     for job in jobs:
         _assert_reaped(job)
+
+
+@pytest.mark.parametrize("workers", ["0", None])
+def test_long_full_request_reads_a_30_second_reference_and_its_soundtrack(monkeypatch, encoders, tmp_path, workers):
+    name = reference_video.MINIMAX_H3_REFERENCE_DECODE_WORKERS_ENV
+    if workers is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, workers)
+    path = str(tmp_path / "long.mp4")
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=s=256x256:r=24"]
+        + ["-f", "lavfi", "-i", "sine=sample_rate=44100", "-t", "30", "-c:v", "libx264", "-preset", "ultrafast"]
+        + ["-pix_fmt", "yuv420p", "-c:a", "aac", path],
+        check=True,
+        timeout=120,
+    )
+
+    def prepare(**extra_args):
+        return processing.prepare_encoder_inputs(
+            {"prompt": "reference", "multi_modal_data": {"video": path}},
+            OmniDiffusionSamplingParams(height=256, width=256, extra_args={"task": "ref2va", **extra_args}),
+        )
+
+    for extra_args in (
+        {"duration": 15},
+        {"duration": 30, "long_video": True},
+        {"duration": 15, "long_video": True, "long_video_mode": "full"},
+    ):
+        with pytest.raises(OmniClientError, match=r"\[2, 15\] seconds"):
+            prepare(**extra_args)
+    prepared = prepare(duration=30, long_video=True, long_video_mode="full")
+    media = prepared.media
+    assert media.num_frames == 736 and media.videos[0].shape[0] == 720
+    waveform, rate = media.video_audios[0]
+    assert waveform.shape[-1] == 30 * rate
+    assert prepared.qwen_videos[0][0].shape[0] == 60 and len(prepared.video_timestamps[0]) == 30
+
+    class VideoVAE:
+        def encode_video(self, frames):
+            return torch.ones(1, 96), (1, 2, 2)
+
+    class AudioVAE:
+        def encode_waveform(self, waveform, sample_rate):
+            length = waveform.shape[-1] * 40 // sample_rate
+            return torch.ones(2 * length, 32), length
+
+    conditioning = processing.encode_media(media, video_vae=VideoVAE(), audio_vae=AudioVAE(), emit_conditioning=True)
+    assert conditioning.audio_condition_lengths == (1200,)
+    assert _ffmpeg_children() == []

@@ -32,7 +32,12 @@ from vllm_omni.model_executor.models.minimax_h3.continuation_request import (
     resolve_continuation_request,
     window_frame_index,
 )
-from vllm_omni.model_executor.models.minimax_h3.long_video import max_output_seconds, resolve_long_video_mode
+from vllm_omni.model_executor.models.minimax_h3.long_video import (
+    max_output_seconds,
+    max_reference_seconds,
+    max_request_reference_seconds,
+    resolve_long_video_mode,
+)
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
     MINIMAX_H3_OUTPUT_SHORT_EDGE,
     load_minimax_h3_images,
@@ -999,6 +1004,7 @@ def _prepare_encoder_inputs(
         parallel=frame_workers > 0,
     )
     keyframe_indices = _resolve_fl2va_keyframe_indices(extra_args, len(images)) if task == "fl2va" else []
+    reference_seconds = max_request_reference_seconds(extra_args, task, num_frames)
     video_timestamps: list[list[float]] = []
     qwen_video_inputs: list[tuple[np.ndarray, dict[str, Any]]] = []
     condition_labels: list[tuple[str, int]] = []
@@ -1023,6 +1029,7 @@ def _prepare_encoder_inputs(
                         start_time_seconds=extra_args.get("start_time_seconds"),
                         decode_frames=frame_workers > 0,
                         frame_workers=frame_workers,
+                        max_total_seconds=reference_seconds,
                     )
                 audio_pool = ThreadPoolExecutor(max_workers=1)
                 try:
@@ -1192,8 +1199,8 @@ def _prepare_encoder_inputs(
         max_standalone_seconds=float(media_input.num_frames) / MINIMAX_H3_FPS,
     )
     embedded_audio_count = sum(item is not None for item in media_input.video_audios)
-    # Video soundtracks and standalone references have separate 15-second budgets.
-    validate_reference_audio_waveforms(audio_inputs[:embedded_audio_count])
+    # Video soundtracks and standalone references have separate budgets.
+    validate_reference_audio_waveforms(audio_inputs[:embedded_audio_count], max_seconds=reference_seconds)
     if not lock_audio:
         validate_reference_audio_waveforms(audio_inputs[embedded_audio_count:])
 
@@ -1297,7 +1304,10 @@ def encode_media(
         max_standalone_seconds=float(media.num_frames) / MINIMAX_H3_FPS,
     )
     embedded_audio_count = sum(item is not None for item in media.video_audios)
-    validate_reference_audio_waveforms([item for item in media.video_audios if item is not None])
+    reference_seconds = max_reference_seconds(media.num_frames)
+    validate_reference_audio_waveforms(
+        [item for item in media.video_audios if item is not None], max_seconds=reference_seconds
+    )
     if media.audio_mode != "lock_source":
         validate_reference_audio_waveforms(media.audios)
     visual_rows: list[torch.Tensor] = []
@@ -1385,9 +1395,15 @@ def encode_media(
     )
     reference_lengths = audio_lengths[:-1] if media.audio_mode == "lock_source" else audio_lengths
     if reference_lengths:
-        if any(length < 80 or length > 600 for length in reference_lengths):
+        embedded, standalone = reference_lengths[:embedded_audio_count], reference_lengths[embedded_audio_count:]
+        embedded_t = _frames_to_audio_t(int(reference_seconds * MINIMAX_H3_FPS))
+        if (
+            any(length < 80 for length in reference_lengths)
+            or any(length > embedded_t for length in embedded)
+            or any(length > 600 for length in standalone)
+        ):
             raise ValueError("MiniMax H3 audio references must each be between 2 and 15 seconds")
-        if sum(reference_lengths[:embedded_audio_count]) > 600 or sum(reference_lengths[embedded_audio_count:]) > 600:
+        if sum(embedded) > embedded_t or sum(standalone) > 600:
             raise ValueError("MiniMax H3 audio references must be at most 15 seconds in total")
 
     ref_blocks: list[dict[str, Any]] = []

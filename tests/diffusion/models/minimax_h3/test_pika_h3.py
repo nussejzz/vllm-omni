@@ -301,6 +301,45 @@ def test_pika_sigma_positions_and_pipeline_request_validation():
     assert base._validate_pika_request(_sampling(num_inference_steps=4), "ref2va") is None
 
 
+def test_pika_ref2va_long_video_defaults_to_full_mode():
+    spec = _spec()
+    assert spec.request_extra_args({"long_video": True}) == {"long_video": True, "long_video_mode": "full"}
+    explicit = {"long_video": True, "long_video_mode": "continuation"}
+    assert spec.request_extra_args(explicit) is explicit
+    with pytest.raises(ValueError, match="continuation"):
+        spec.check_request(_sampling(extra_args=explicit), "ref2va")
+    for extra in (None, {}, {"long_video": False}, {"long_video": "true"}, {"duration": 10}):
+        assert spec.request_extra_args(extra) is extra
+    fl2va = {"long_video": True}
+    assert _spec("fl2va").request_extra_args(fl2va) is fl2va
+
+
+@pytest.mark.parametrize("pika", [True, False])
+def test_pika_long_video_mode_is_resolved_before_encoding(pika, monkeypatch):
+    from vllm_omni.diffusion.models.minimax_h3.continuation import resolve_continuation
+    from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
+
+    pipe = object.__new__(pipeline_module.MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipe)
+    pipe.load_text_encoder = pipe.load_vae_encoder = False
+    pipe._pika_spec = _spec() if pika else None
+    seen = []
+    monkeypatch.setattr(pipe, "_extract_encoder_conditioning", lambda prompt: prompt)
+    monkeypatch.setattr(
+        pipe,
+        "_prepare_encoder_conditioning_inputs",
+        lambda conditioning, sampling, control_media=None: seen.append(sampling.extra_args) or {},
+    )
+    pipe._prepare_request_inputs({"prompt": "p"}, _sampling(extra_args={"long_video": True, "duration": 30}))
+    (extra,) = seen
+    continuation = resolve_continuation(extra, task="ref2va", step_execution=False)
+    if pika:
+        assert extra == {"long_video": True, "duration": 30, "long_video_mode": "full"} and continuation is None
+        validate_encoded_frame_limit(extra, "ref2va", 736)
+    else:
+        assert "long_video_mode" not in extra and continuation is not None
+
+
 def _startup_pipe(partition="ref2va", base_schedule=None):
     pipe = object.__new__(pipeline_module.MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipe)

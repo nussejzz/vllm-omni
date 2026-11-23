@@ -121,6 +121,11 @@ class PikaSpec:
     def audio_sigmas(self) -> list[float]:
         return pika_sigmas(PIKA_AUDIO_SHIFT)
 
+    def request_extra_args(self, extra: dict[str, Any] | None) -> dict[str, Any] | None:
+        if self.task != "ref2va" or not extra or extra.get("long_video") is not True or "long_video_mode" in extra:
+            return extra
+        return {**extra, "long_video_mode": "full"}
+
     def check_request(self, sampling: Any, task: str, *, step_execution: bool = False) -> None:
         """Reject request options that would leave Pika's sampling contract.
 

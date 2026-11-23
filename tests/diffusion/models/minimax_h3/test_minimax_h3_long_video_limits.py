@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Duration limits apply before encoding and to transported encoder payloads."""
 
+import os
+import tempfile
 from types import SimpleNamespace
 from typing import Any
 
@@ -11,11 +13,19 @@ from PIL import Image
 
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.model_executor.models.minimax_h3 import reference_video
 from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     prepare_encoder_inputs,
     resolve_minimax_h3_shape,
 )
-from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
+from vllm_omni.model_executor.models.minimax_h3.long_video import (
+    MINIMAX_H3_MAX_FULL_SECONDS_ENV,
+    max_full_seconds,
+    max_output_seconds,
+    max_reference_seconds,
+    max_request_reference_seconds,
+    validate_encoded_frame_limit,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -156,3 +166,97 @@ def test_external_encoder_cannot_bypass_full_duration_limit():
     sampling = OmniDiffusionSamplingParams(extra_args={"long_video": True, "long_video_mode": "full"})
     with pytest.raises(OmniClientError, match="30-second request limit"):
         pipeline._prepare_encoder_conditioning_inputs(SimpleNamespace(task="ref2va", num_frames=7213), sampling)
+
+
+_FULL = {"long_video": True, "long_video_mode": "full"}
+
+
+@pytest.mark.parametrize(
+    ("extra", "task", "num_frames", "seconds"),
+    [
+        ({}, "ref2va", 362, 15),
+        ({"long_video_mode": "full"}, "ref2va", 736, 15),
+        ({"long_video": True}, "ref2va", 736, 15),
+        ({"long_video": True, "long_video_mode": "continuation"}, "ref2va", 736, 15),
+        (_FULL, "ref2va", 362, 15),
+        (_FULL, "ref2va", 379, 30),
+        (_FULL, "ref2va", 736, 30),
+        ({"long_video": True}, "t2va", 736, 30),
+    ],
+)
+def test_reference_limit_opens_only_for_long_full_outputs(extra, task, num_frames, seconds):
+    assert max_request_reference_seconds(extra, task, num_frames) == seconds
+    assert max_reference_seconds(num_frames) >= seconds
+
+
+def test_encoded_soundtrack_limit_is_unchanged_on_the_short_grid():
+    assert [max_reference_seconds(frames) for frames in (124, 362, 379, 736)] == [15, 15, 30, 30]
+
+
+def _prepare_references(monkeypatch, tmp_path, durations, **kwargs):
+    meta = {
+        "width": 1280,
+        "height": 720,
+        "fps": 24.0,
+        "format_names": ("mp4",),
+        "video_codec": "h264",
+        "audio_codecs": ("aac",),
+        "file_size": 1024,
+    }
+
+    def probe(path):
+        duration = durations[os.path.basename(path)]
+        return {**meta, "duration": duration, "frame_count": int(duration * 24)}
+
+    monkeypatch.setattr(reference_video, "_probe_video", probe)
+    monkeypatch.setattr(reference_video, "_transcode_reference_video", lambda source, **_: source)
+    return reference_video.prepare_reference_videos(
+        [str(tmp_path / name) for name in durations],
+        target_frame_count=736,
+        workdir=tempfile.mkdtemp(dir=tmp_path),
+        **kwargs,
+    )
+
+
+def test_reference_videos_accept_the_long_full_budget_only_when_asked(monkeypatch, tmp_path):
+    with pytest.raises(OmniClientError, match=r"\[2, 15\] seconds"):
+        _prepare_references(monkeypatch, tmp_path, {"a.mp4": 30.0})
+    with pytest.raises(OmniClientError, match="at most 15 seconds in total"):
+        _prepare_references(monkeypatch, tmp_path, {"a.mp4": 10.0, "b.mp4": 10.0})
+    (item,) = _prepare_references(monkeypatch, tmp_path, {"a.mp4": 30.0}, max_total_seconds=30.0)
+    assert item["duration_seconds"] == item["audio_duration_seconds"] == 30.0
+    assert len(_prepare_references(monkeypatch, tmp_path, {"a.mp4": 15.0, "b.mp4": 15.0}, max_total_seconds=30.0)) == 2
+    with pytest.raises(OmniClientError, match=r"\[2, 30\] seconds"):
+        _prepare_references(monkeypatch, tmp_path, {"a.mp4": 31.0}, max_total_seconds=30.0)
+    with pytest.raises(OmniClientError, match="at most 30 seconds in total"):
+        _prepare_references(monkeypatch, tmp_path, {"a.mp4": 20.0, "b.mp4": 11.0}, max_total_seconds=30.0)
+
+
+def test_soundtrack_waveforms_follow_the_reference_limit():
+    rate = 16000
+    thirty = [(torch.zeros(1, 30 * rate), rate)]
+    with pytest.raises(OmniClientError, match=r"\[2, 15\] seconds"):
+        reference_video.validate_reference_audio_waveforms(thirty)
+    reference_video.validate_reference_audio_waveforms(thirty, max_seconds=30.0)
+    with pytest.raises(OmniClientError, match="at most 30 seconds in total"):
+        reference_video.validate_reference_audio_waveforms([(torch.zeros(1, 16 * rate), rate)] * 2, max_seconds=30.0)
+
+
+def test_full_mode_cap_reads_its_environment_override(monkeypatch):
+    sampling = OmniDiffusionSamplingParams(width=64, height=64, fps=24, extra_args={**_FULL, "duration": 45})
+    with pytest.raises(OmniClientError, match="30"):
+        resolve_minimax_h3_shape("ref2va", sampling, None)
+    monkeypatch.setenv(MINIMAX_H3_MAX_FULL_SECONDS_ENV, "45")
+    assert max_output_seconds(_FULL, "ref2va") == 45
+    assert max_output_seconds({}, "ref2va") == 15
+    frames = resolve_minimax_h3_shape("ref2va", sampling, None)[2]
+    assert frames >= 45 * 24
+    validate_encoded_frame_limit(_FULL, "ref2va", frames)
+    assert max_request_reference_seconds(_FULL, "ref2va", frames) == 45
+    assert max_reference_seconds(362) == 15
+    for raw in ("10", "61", "nan", "inf", "abc"):
+        monkeypatch.setenv(MINIMAX_H3_MAX_FULL_SECONDS_ENV, raw)
+        with pytest.raises(ValueError, match=MINIMAX_H3_MAX_FULL_SECONDS_ENV):
+            max_full_seconds()
+    monkeypatch.delenv(MINIMAX_H3_MAX_FULL_SECONDS_ENV)
+    assert max_full_seconds() == 30

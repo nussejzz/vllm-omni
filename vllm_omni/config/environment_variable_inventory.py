@@ -262,6 +262,7 @@ _MODEL_INTERNALIZE = (
     "MAGI2_ROUTER_BIAS_SOURCE",
     "NEMOTRON_VOICECHAT_DEBUG_FUNCTION_TIMELINE",
     "VLLM_OMNI_CODE2WAV_STATS",
+    "VLLM_OMNI_H3_MAX_FULL_SECONDS",
     # MiniMax-H3: transitional rollback/A-B switch for encoding Ref2VA
     # reference audio while the reference frames decode (0 = after video VAE).
     "VLLM_OMNI_H3_AUDIO_ENCODE_EARLY",

@@ -3654,6 +3654,9 @@ class MiniMaxH3Pipeline(
                 executor.shutdown(wait=True, cancel_futures=True)
 
     def _prepare_request_inputs(self, raw_prompt: Any, sampling: Any) -> dict[str, Any]:
+        pika = getattr(self, "_pika_spec", None)
+        if pika is not None:
+            sampling.extra_args = pika.request_extra_args(sampling.extra_args)
         if (getattr(sampling, "extra_args", None) or {}).get(
             "continuation_prompts"
         ) is not None and not self.load_text_encoder:

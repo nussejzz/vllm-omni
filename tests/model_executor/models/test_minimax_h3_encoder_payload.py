@@ -473,6 +473,50 @@ def test_encode_media_keeps_audio_budgets_and_component_residency_separate(
     assert scopes == ([video_vae, audio_vae] if valid else [])
 
 
+@pytest.mark.parametrize(
+    ("num_frames", "embedded_lengths", "standalone_lengths", "error"),
+    [
+        (736, (1200,), (400,), None),
+        (736, (600, 600), (), None),
+        (736, (1250,), (), r"\[2, 30\] seconds"),
+        (736, (640, 640), (), "at most 30 seconds in total"),
+        (736, (400,), (640,), r"\[2, 15\] seconds"),
+        (362, (640,), (), r"\[2, 15\] seconds"),
+    ],
+)
+def test_encode_media_scales_only_the_soundtrack_budget_past_15_seconds(
+    num_frames, embedded_lengths, standalone_lengths, error
+) -> None:
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import encode_media
+
+    class VideoVAE:
+        def encode_video(self, _frames):
+            return torch.ones(1, 96), (1, 2, 2)
+
+    class AudioVAE:
+        def encode_waveform(self, waveform, _sample_rate):
+            length = waveform.shape[-1] // 800
+            return torch.ones(2 * length, 32), length
+
+    media = MiniMaxH3EncoderMediaInput(
+        task="ref2va",
+        height=32,
+        width=32,
+        num_frames=num_frames,
+        latent_t=217,
+        audio_t=1227,
+        videos=tuple(torch.zeros(1, 32, 32, 3, dtype=torch.uint8) for _ in embedded_lengths),
+        video_audios=tuple((torch.zeros(length * 800), 32_000) for length in embedded_lengths),
+        audios=tuple((torch.zeros(length * 800), 32_000) for length in standalone_lengths),
+    )
+    kwargs = dict(video_vae=VideoVAE(), audio_vae=AudioVAE(), emit_conditioning=True)
+    if error is None:
+        assert encode_media(media, **kwargs).audio_condition_lengths == embedded_lengths + standalone_lengths
+    else:
+        with pytest.raises(ValueError, match=error):
+            encode_media(media, **kwargs)
+
+
 def test_encoder_output_reuses_encoder_handoff_and_round_trips(monkeypatch) -> None:
     expected = MiniMaxH3EncoderConditioning(
         hidden_states=torch.randn(3, 5120, dtype=torch.bfloat16),
