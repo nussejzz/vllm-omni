@@ -120,6 +120,7 @@ def plan_latent_continuation(
     num_frames: int,
     latent_h: int,
     latent_w: int,
+    lookahead: int = 0,
 ) -> LatentContinuation:
     """Place a ``num_frames`` window so its first ``overlap`` frames repeat the clip tail."""
     overlap = request.overlap_frames
@@ -136,17 +137,25 @@ def plan_latent_continuation(
         raise OmniClientError(
             f"MiniMax H3 continuation window ({num_frames} frames) must exceed continue_overlap_frames ({overlap})"
         )
-    start = clip.end_frame - overlap
+    if overlap + lookahead > clip.num_frames:
+        raise OmniClientError(
+            f"MiniMax H3 h3_seam.lookahead ({lookahead}) leaves less than continue_overlap_frames ({overlap}) "
+            f"of the source video ({clip.num_frames} frames)"
+        )
+    end = clip.end_frame - lookahead
+    start = end - overlap
     if start + num_frames > _MAX_TIMELINE_FRAMES:
         raise OmniClientError(
             f"MiniMax H3 continuation chains are limited to {MINIMAX_H3_MAX_CONTINUATION_SECONDS:g} seconds"
         )
-    overlap_audio_t = _audio_t(clip.end_frame) - _audio_t(start)
-    if overlap_audio_t > clip.audio.shape[-1]:
+    overlap_audio_t = _audio_t(end) - _audio_t(start)
+    video_end = clip.video.shape[2] - lookahead // 17 * 5
+    audio_end = clip.audio.shape[-1] - (_audio_t(clip.end_frame) - _audio_t(end))
+    if overlap_audio_t > audio_end:
         raise OmniClientError("MiniMax H3 cached source audio is shorter than the requested overlap")
     prefix = LatentPrefix(
-        video=clip.video[:, :, -_video_t(overlap) :],
-        audio=clip.audio[..., -overlap_audio_t:],
+        video=clip.video[:, :, video_end - _video_t(overlap) : video_end],
+        audio=clip.audio[..., audio_end - overlap_audio_t : audio_end],
         start_frame=start,
         overlap_frames=overlap,
     )

@@ -134,10 +134,12 @@ from .condition_noise import (
 from .continuation import (
     ContinuationWindow,
     LatentPrefix,
+    SeamOptions,
     _audio_t,
     diffuse_continuation,
     plan_continuation_windows,
     resolve_continuation,
+    resolve_seam,
     window_args,
 )
 from .controlnet import MINIMAX_H3_CONTROL_MEDIA_KEY, build_control_rows, load_control_pixels, parse_control
@@ -2391,6 +2393,7 @@ class MiniMaxH3Pipeline(
         precomputed_initial_noise: tuple[torch.Tensor, torch.Tensor] | None = None,
         precomputed_visual_condition_noise: torch.Tensor | None = None,
         pika: PikaSpec | None = None,
+        seam: SeamOptions | None = None,
     ) -> dict[str, Any]:
         """Build the packed layout, initial rows, anchors, and sigma schedules.
 
@@ -2412,7 +2415,7 @@ class MiniMaxH3Pipeline(
                 "driving audio (audio_mode=lock_source)": locked_audio_rows is not None,
                 "latent refine / init latents": init_latents is not None or refine is not None,
                 "control conditioning": control_rows is not None,
-                "timeline guides / continuation": bool(guide_blocks) or temporal_offset != 0.0,
+                "timeline guides / continuation": seam is None and (bool(guide_blocks) or temporal_offset != 0.0),
             }
             rejected = [name for name, present in unsupported.items() if present]
             if rejected:
@@ -2756,6 +2759,9 @@ class MiniMaxH3Pipeline(
         refine: MiniMaxH3LatentRefineSpec | None = None,
         request_context: dict[str, Any] | None = None,
         pika: PikaSpec | None = None,
+        seam: SeamOptions | None = None,
+        pins: tuple | None = None,
+        pin_trace: list | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         inject = os.environ.get(PIKA_INJECT_DIR_ENV) if pika is not None else None
         if inject:
@@ -2771,6 +2777,7 @@ class MiniMaxH3Pipeline(
         with h3_range("h3.prepare"):
             inputs = self._build_denoise_inputs(
                 pika=pika,
+                seam=seam,
                 sampler=sampler,
                 task=task,
                 text_embeddings=text_embeddings,
@@ -2877,6 +2884,8 @@ class MiniMaxH3Pipeline(
                         video_edit=inputs["video_edit"],
                         audio_edit=inputs["audio_edit"],
                         update_progress=on_step,
+                        pins=pins,
+                        pin_trace=pin_trace,
                     )
 
         with h3_range("h3.post.unpack_rows"):
@@ -3532,11 +3541,21 @@ class MiniMaxH3Pipeline(
                         prepared_reference_videos=self._extract_prepared_reference_videos(raw_prompt),
                         reference_audio=reference_audio,
                     )
-                continuation = None
-                if prompts is not None or (request_context is not None and task == "ref2va"):
+                continuation = seam = None
+                if (
+                    prompts is not None
+                    or (request_context is not None and task == "ref2va")
+                    or (sampling.extra_args or {}).get("h3_seam") is not None
+                ):
                     continuation = resolve_continuation(
                         sampling.extra_args or {},
                         task=task,
+                        step_execution=bool(getattr(self.od_config, "step_execution", False)),
+                    )
+                    seam = resolve_seam(
+                        sampling.extra_args or {},
+                        continuation=continuation,
+                        renoise=pika is not None,
                         step_execution=bool(getattr(self.od_config, "step_execution", False)),
                     )
                 if prompts is not None:
@@ -3545,7 +3564,14 @@ class MiniMaxH3Pipeline(
                             "continuation_prompts requires continuation mode with a local text encoder"
                         )
                     window, overlap = continuation
-                    count = len(plan_continuation_windows(prepared.media.num_frames, window, overlap))
+                    count = len(
+                        plan_continuation_windows(
+                            prepared.media.num_frames,
+                            window,
+                            overlap,
+                            lookahead=seam.lookahead if seam is not None else 0,
+                        )
+                    )
                     if (
                         not isinstance(prompts, list)
                         or len(prompts) != count
@@ -3770,9 +3796,15 @@ class MiniMaxH3Pipeline(
         if has_native_lora:
             self._validate_native_sampling(sampling, task=task)
         pika = self._validate_pika_request(sampling, task)
+        seam = resolve_seam(
+            extra,
+            continuation=continuation,
+            renoise=pika is not None,
+            step_execution=bool(getattr(self.od_config, "step_execution", False)),
+        )
         if pika is not None and (
             control is not None
-            or continuation is not None
+            or (continuation is not None and seam is None)
             or conditioning.guide_blocks
             or conditioning.video_edit_clean_rows is not None
             or conditioning.audio_edit_clean_rows is not None
@@ -3809,7 +3841,10 @@ class MiniMaxH3Pipeline(
             )
 
         conditioning, latent_continuation = self._resolve_latent_continuation(
-            extra, conditioning, inherit_canvas=continuation_inherits_source_canvas(conditioning.task, sampling)
+            extra,
+            conditioning,
+            inherit_canvas=continuation_inherits_source_canvas(conditioning.task, sampling),
+            lookahead=seam.lookahead if seam is not None else 0,
         )
         # A continuation samples audio on the chain's global timeline, which may
         # differ by a rounding step from the encoder's standalone length.
@@ -3995,7 +4030,7 @@ class MiniMaxH3Pipeline(
             extra, latent_h=conditioning.height // 16, latent_w=conditioning.width // 16
         )
         latent_refine = self._resolve_latent_refine(extra)
-        if pika is not None and (latent_refine is not None or latent_continuation is not None):
+        if pika is not None and (latent_refine is not None or (latent_continuation is not None and seam is None)):
             raise OmniClientError(
                 f"{pika.name} runs its full released schedule; latent_refine and continue_from are unsupported "
                 "(latent_upscale alone is allowed)"
@@ -4103,6 +4138,7 @@ class MiniMaxH3Pipeline(
             ),
             "base_schedule": base_schedule,
             "pika": pika,
+            "seam": seam,
             "num_outputs": num_outputs,
             "preencode_mp4": bool(extra.get("preencode_mp4", False)),
             "preencode_batch_frames": (
@@ -4292,6 +4328,7 @@ class MiniMaxH3Pipeline(
         conditioning: MiniMaxH3EncoderConditioning,
         *,
         inherit_canvas: bool,
+        lookahead: int = 0,
     ) -> tuple[MiniMaxH3EncoderConditioning, LatentContinuation | None]:
         """Hide the cached tail of ``extra['continue_from']`` in front of the encoded window.
 
@@ -4326,6 +4363,7 @@ class MiniMaxH3Pipeline(
             num_frames=conditioning.num_frames,
             latent_h=conditioning.height // 16,
             latent_w=conditioning.width // 16,
+            lookahead=lookahead,
         )
 
     def _validate_timeline_guide_sampling(
@@ -4425,6 +4463,8 @@ class MiniMaxH3Pipeline(
         }
         if context.get("pika") is not None:
             kwargs["pika"] = context["pika"]
+        if context.get("seam") is not None:
+            kwargs["seam"] = context["seam"]
         return kwargs
 
     @torch.no_grad()
@@ -4445,7 +4485,8 @@ class MiniMaxH3Pipeline(
         height, width = _minimax_h3_output_canvas(context, upscale_target)
         latent_continuation = context.get("latent_continuation")
         prefix = None if latent_continuation is None else _device_prefix(latent_continuation, self.device)
-        trim = _continuation_trim(latent_continuation)
+        seam = context.get("seam")
+        trim = None if seam is not None and seam.return_overlap else _continuation_trim(latent_continuation)
         videos = []
         audios = []
         # Each seed appends one count on the output owner and none on peers;

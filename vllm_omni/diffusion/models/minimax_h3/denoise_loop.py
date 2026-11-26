@@ -338,6 +338,8 @@ def minimax_h3_denoise_loop(
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     sampler: str = "euler",
     noise_source: RenoiseNoiseSource | None = None,
+    pins: tuple | None = None,
+    pin_trace: list | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -351,6 +353,8 @@ def minimax_h3_denoise_loop(
     """
     if (sampler == RENOISE_SAMPLER) != (noise_source is not None):
         raise ValueError("the renoise sampler requires a request noise source, and only it uses one")
+    if pins is not None and noise_source is None:
+        raise ValueError("x0 pins require the re-noising sampler")
     if len(sigmas_video) != len(sigmas_audio):
         raise ValueError("video/audio sigma schedules must have equal length")
     if len(sigmas_video) < 2:
@@ -403,6 +407,8 @@ def minimax_h3_denoise_loop(
             (video_edit, audio_edit),
             (imgvid_cond_noise_aug_for_inference, audio_cond_noise_aug_for_inference),
             grid_sigma_x0=noise_source is not None,
+            pins=pins,
+            pin_trace=pin_trace,
         )
         state = SamplingState(
             (video_rows[update], audio_rows[audio_update]), (sigmas_video, sigmas_audio), history=noise_source

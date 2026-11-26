@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.logger import init_logger
@@ -50,6 +50,8 @@ class MiniMaxH3Model:
         attention_schedule=None,
         attention_sigma_schedule=(),
         grid_sigma_x0: bool = False,
+        pins: tuple | None = None,
+        pin_trace: list[dict[str, Any]] | None = None,
     ):
         self.transformer, self.branch, self.rows = transformer, branch, rows
         self.attention_schedule = attention_schedule
@@ -58,6 +60,9 @@ class MiniMaxH3Model:
         self.grid_sigma_x0 = bool(grid_sigma_x0)
         if self.grid_sigma_x0 and any(edit is not None for edit in edits):
             raise ValueError("grid-sigma x0 does not support latent edits")
+        if pins is not None and not self.grid_sigma_x0:
+            raise ValueError("x0 pins require grid-sigma x0 (the re-noising sampler)")
+        self.pins, self.pin_trace = pins, pin_trace
         # Fixed condition rows stay in this buffer; each prediction replaces
         # the target rows. Keep it for the entire request, including retries.
         self.model_rows = model_rows if model_rows is not None else tuple(row.clone() for row in rows)
@@ -95,10 +100,11 @@ class MiniMaxH3Model:
         rows, model_rows, times, _ = prepared
         if self.grid_sigma_x0:
             # Pika: rows + float(sigma) * v.float(), a rounded multiply then a rounded add.
-            return tuple(
+            x0 = tuple(
                 row[mask] + sigma * v.float()[mask]
                 for row, mask, sigma, v in zip(rows, self.masks, prepared.sigmas, velocities, strict=True)
             )
+            return x0 if self.pins is None else self._pinned(x0, prepared.sigmas)
         return tuple(
             minimax_h3_rf_v_to_x0(row[mask], v.float()[mask], row.new_tensor(t))
             if edit is None
@@ -107,6 +113,21 @@ class MiniMaxH3Model:
                 rows, model_rows, self.masks, self.edits, times, velocities, strict=True
             )
         )
+
+    def _pinned(self, x0, sigmas):
+        trace = None if self.pin_trace is None else {"sigma_video": sigmas[0], "sigma_audio": sigmas[1]}
+        for name, x, pin in zip(("video", "audio"), x0, self.pins, strict=True):
+            if pin is None:
+                continue
+            rows, values, groups = pin
+            if trace is not None:
+                error = (x[rows] - values).reshape(groups, -1).norm(dim=1)
+                scale = values.reshape(groups, -1).norm(dim=1).clamp_min(1e-12)
+                trace[name] = [round(float(value), 5) for value in (error / scale).tolist()]
+            x[rows] = values
+        if trace is not None:
+            self.pin_trace.append(trace)
+        return x0
 
     def validate_write_back(self, state: SamplingState):
         """Check both streams before any request's full rows are updated."""

@@ -157,9 +157,11 @@ class PikaSpec:
                 raise ValueError(f"{self.name} requires {key}={value:g} (or omitted), got {raw!r}")
         if extra.get("sampler") not in (None, "renoise"):
             raise ValueError(f"{self.name} uses its own re-noising sampler; remove sampler={extra['sampler']!r}")
-        if extra.get("long_video_mode", "full") != "full" or extra.get("continuation_prompts") is not None:
+        seam = self.task == "ref2va" and extra.get("h3_seam") is not None
+        continuation = extra.get("long_video_mode", "full") != "full" or extra.get("continuation_prompts") is not None
+        if continuation and not seam:
             raise ValueError(f"{self.name} generates full clips; continuation is not supported")
-        if extra.get("continue_from") is not None:
+        if not seam and extra.get("continue_from") is not None:
             raise ValueError(f"{self.name} does not support continue_from")
         if extra.get("audio_mode", "native") != "native":
             raise ValueError(f"{self.name} requires audio_mode=native")
