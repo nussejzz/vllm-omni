@@ -15,6 +15,32 @@ MINIMAX_H3_TEXT_CONDITIONING_SCHEMA = "minimax_h3.text_conditioning/v1"
 MINIMAX_H3_TEXT_HIDDEN_SIZE = 5120
 MINIMAX_H3_PRESENTATION_TASK_KEY = "_minimax_h3_presentation_task"
 MINIMAX_H3_CONDITION_LABELS_KEY = "_minimax_h3_condition_labels"
+MINIMAX_H3_REFERENCE_ORDER_KEY = "minimax_h3_reference_order"
+MINIMAX_H3_REFERENCE_KINDS = ("image", "video", "audio")
+
+
+def resolve_minimax_h3_reference_order(
+    order: Sequence[str] | None,
+    *,
+    images: int,
+    videos: int,
+    audios: int,
+) -> tuple[str, ...]:
+    """Return the request order of the Ref2VA references, one kind per reference.
+
+    The k-th occurrence of a kind is the k-th item of that kind's list. Without an
+    order the references keep the grouped images, videos, audios order.
+    """
+    if order is None:
+        return ("image",) * images + ("video",) * videos + ("audio",) * audios
+    if isinstance(order, (str, bytes)) or not isinstance(order, Sequence):
+        raise ValueError("MiniMax H3 reference order must be a list of reference kinds")
+    resolved = tuple(order)
+    if any(kind not in MINIMAX_H3_REFERENCE_KINDS for kind in resolved):
+        raise ValueError(f"MiniMax H3 reference order kinds must be one of {MINIMAX_H3_REFERENCE_KINDS}")
+    if (resolved.count("image"), resolved.count("video"), resolved.count("audio")) != (images, videos, audios):
+        raise ValueError("MiniMax H3 reference order must name every image, video and audio reference once")
+    return resolved
 
 
 def _validate_contiguous_strided_layout(name: str, tensor: torch.Tensor) -> None:
@@ -405,6 +431,20 @@ class MiniMaxH3EncoderMediaInput:
     audio_edit: tuple[torch.Tensor, int] | None = None
     audio_edit_mask: torch.Tensor | None = None
     timeline_guides: tuple[MiniMaxH3TimelineGuide, ...] = ()
+    reference_order: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.reference_order:
+            self.reference_kinds()
+
+    def reference_kinds(self) -> tuple[str, ...]:
+        """Kinds of the Ref2VA references in request order; a driving audio is not a reference."""
+        return resolve_minimax_h3_reference_order(
+            self.reference_order or None,
+            images=len(self.images),
+            videos=len(self.videos),
+            audios=0 if self.audio_mode == "lock_source" else len(self.audios),
+        )
 
     @classmethod
     def from_mm_tensors(
@@ -558,6 +598,7 @@ class MiniMaxH3EncoderMediaInput:
             audio_edit=audio_edit,
             audio_edit_mask=audio_edit_mask,
             timeline_guides=tuple(timeline_guides),
+            reference_order=tuple(str(kind) for kind in metadata.get("reference_order", ())),
         )
 
     def to_mm_tensors(self) -> list[torch.Tensor]:
@@ -640,6 +681,8 @@ class MiniMaxH3EncoderMediaInput:
             "audio_sample_rates": [sample_rate for _waveform, sample_rate in self.audios],
             "keyframe_frame_indices": list(self.keyframe_frame_indices),
         }
+        if self.reference_order:
+            metadata["reference_order"] = list(self.reference_order)
         if self.video_edit is not None:
             metadata["has_video_edit"] = True
         if self.audio_edit is not None:

@@ -28,6 +28,7 @@ from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MINIMAX_H3_ENCODER_LAYOUT_KEY,
     MINIMAX_H3_ENCODER_REQUEST_KEY,
     MINIMAX_H3_PRESENTATION_TASK_KEY,
+    MINIMAX_H3_REFERENCE_ORDER_KEY,
     MINIMAX_H3_TEXT_CONDITIONING_SCHEMA,
     MiniMaxH3EncoderConditioning,
 )
@@ -272,6 +273,71 @@ def test_prepare_ref2va_uses_separate_embedded_and_standalone_audio_budgets(monk
         assert len(media.video_audios) == 1 and len(media.audios) == 1
         assert media.video_audios[0][0].shape[-1] == 8 * sample_rate
         assert media.audios[0][0].shape[-1] == 8 * sample_rate
+
+
+@pytest.mark.parametrize(
+    ("order", "labels", "stored"),
+    [
+        (None, [("image", 1), ("audio", 1), ("video", 1), ("audio", 2)], None),
+        (["image", "video", "audio"], [("image", 1), ("audio", 1), ("video", 1), ("audio", 2)], None),
+        (["video", "image"], [("audio", 1), ("video", 1), ("image", 1)], ["video", "image"]),
+        (
+            ["video", "audio", "image"],
+            [("audio", 1), ("video", 1), ("audio", 2), ("image", 1)],
+            ["video", "audio", "image"],
+        ),
+        (
+            ["audio", "video", "image"],
+            [("audio", 1), ("audio", 2), ("video", 1), ("image", 1)],
+            ["audio", "video", "image"],
+        ),
+        (["audio", "image"], [("audio", 1), ("image", 1)], ["audio", "image"]),
+    ],
+)
+def test_prepare_ref2va_follows_the_request_reference_order(monkeypatch, order, labels, stored):
+    from vllm_omni.model_executor.models.minimax_h3.encoder import MiniMaxH3Encoder
+
+    _mock_ref2va_video_with_audio(monkeypatch, duration_seconds=8.0)
+    references = {
+        "image": Image.new("RGB", (256, 256)),
+        "video": "original.mp4",
+        "audio": (torch.zeros(8 * 16_000), 16_000),
+    }
+    multi_modal_data = {kind: references[kind] for kind in order or references}
+    if order is not None:
+        multi_modal_data[MINIMAX_H3_REFERENCE_ORDER_KEY] = order
+    sampling = OmniDiffusionSamplingParams(height=256, width=448, num_frames=240, extra_args={"task": "ref2va"})
+
+    transformed = prepare_encoder_prompt({"prompt": "hello", "multi_modal_data": multi_modal_data}, [sampling])
+
+    assert transformed["mm_processor_kwargs"][MINIMAX_H3_CONDITION_LABELS_KEY] == labels
+    info = deserialize_additional_information(serialize_additional_information(transformed["additional_information"]))
+    assert info["meta"][MINIMAX_H3_ENCODER_REQUEST_KEY].get("reference_order") == stored
+    assert MiniMaxH3Encoder._media_input(info).reference_order == tuple(stored or ())
+
+
+@pytest.mark.parametrize(
+    ("order", "message"),
+    [
+        (["image"], "name every image, video and audio reference once"),
+        (["image", "audio", "audio"], "name every image, video and audio reference once"),
+        (["image", "voice"], "kinds must be one of"),
+        ("image,audio", "must be a list of reference kinds"),
+    ],
+)
+def test_prepare_ref2va_rejects_a_mismatched_reference_order(order, message):
+    prompt = {
+        "prompt": "hello",
+        "multi_modal_data": {
+            "image": Image.new("RGB", (256, 256)),
+            "audio": [np.zeros(32_000), 16_000],
+            MINIMAX_H3_REFERENCE_ORDER_KEY: order,
+        },
+    }
+    sampling = OmniDiffusionSamplingParams(height=256, width=448, extra_args={"task": "ref2va"})
+
+    with pytest.raises(OmniClientError, match=message):
+        prepare_encoder_prompt(prompt, [sampling])
 
 
 def _encoder_output() -> dict:

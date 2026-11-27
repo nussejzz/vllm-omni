@@ -906,16 +906,17 @@ def _validate_minimax_h3_image_payload(
 
 async def _persist_uploaded_media_references(
     uploads: list[UploadFile],
-) -> tuple[list[Image.Image], list[str], list[str]]:
+) -> tuple[list[Image.Image], list[str], list[str], list[str]]:
     """Persist a mixed MiniMax H3 multipart reference list.
 
     Images are decoded in memory; videos and audio remain files because H3's
     reference encoders need the original container streams (including video
-    soundtracks).
+    soundtracks). The kinds are returned in upload order.
     """
     images: list[Image.Image] = []
     videos: list[str] = []
     audios: list[str] = []
+    kinds: list[str] = []
     paths: list[str] = []
     if len(uploads) > MINIMAX_H3_MAX_REFERENCE_COUNT:
         raise HTTPException(
@@ -925,6 +926,7 @@ async def _persist_uploaded_media_references(
     try:
         for upload in uploads:
             kind = _uploaded_media_kind(upload)
+            kinds.append(kind)
             payload = await _read_upload_limited(upload, max_bytes=_minimax_h3_upload_limit(upload))
             if kind == "image":
                 try:
@@ -964,7 +966,7 @@ async def _persist_uploaded_media_references(
             if os.path.exists(path):
                 os.unlink(path)
         raise
-    return images, videos, audios
+    return images, videos, audios, kinds
 
 
 def _parse_timeline_guides(
@@ -1337,7 +1339,8 @@ async def _parse_video_form(
             reference_video = ReferenceVideo(data=video_paths, cleanup_paths=tuple(video_paths))
             images, audio_paths = [], []
         else:
-            images, video_paths, audio_paths = await _persist_uploaded_media_references(input_references)
+            images, video_paths, audio_paths, kinds = await _persist_uploaded_media_references(input_references)
+            request._minimax_h3_reference_order = kinds
         if images:
             reference_image = ReferenceImage(data=images if len(images) > 1 else images[0])
         if video_paths:
@@ -1409,6 +1412,8 @@ async def _parse_video_form(
         try:
             for audio_reference in _reference_list(request.audio_reference):
                 audio_paths.append(await decode_audio_url(audio_reference.audio_url))
+                if request._minimax_h3_reference_order:
+                    request._minimax_h3_reference_order.append("audio")
         except InvalidInputReferenceError as exc:
             _cleanup_video_references(reference_video, reference_audio, request)
             cleanup_paths = set(() if reference_audio is None else reference_audio.cleanup_paths)

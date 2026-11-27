@@ -527,6 +527,8 @@ class OmniOpenAIServingVideo:
         if request._minimax_h3_control_media:
             # MINIMAX_H3_CONTROL_MEDIA_KEY: server-persisted control uploads, never request extras.
             multi_modal_data["minimax_h3_control"] = dict(request._minimax_h3_control_media)
+        if request._minimax_h3_reference_order:
+            multi_modal_data["minimax_h3_reference_order"] = list(request._minimax_h3_reference_order)
         if multi_modal_data:
             prompt["multi_modal_data"] = multi_modal_data
         if vp.width is not None and vp.height is not None:

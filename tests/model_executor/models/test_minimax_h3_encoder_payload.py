@@ -517,6 +517,125 @@ def test_encode_media_scales_only_the_soundtrack_budget_past_15_seconds(
             encode_media(media, **kwargs)
 
 
+class _OrderVideoVAE:
+    def encode_image(self, _image):
+        return torch.full((2, 96), 1.0)
+
+    def encode_video(self, _frames):
+        return torch.full((2, 96), 2.0), (2, 2, 2)
+
+    def predict_video_latent_shape(self, _frames):
+        return (2, 2, 2)
+
+
+class _OrderAudioVAE:
+    def encode_waveform(self, waveform, _sample_rate):
+        length = waveform.shape[-1] // 800
+        return torch.full((2 * length, 32), float(waveform[0])), length
+
+
+def _ordered_media(reference_order=(), audio_mode="native"):
+    return MiniMaxH3EncoderMediaInput(
+        task="ref2va",
+        height=32,
+        width=32,
+        num_frames=360,
+        latent_t=90,
+        audio_t=600,
+        images=(torch.zeros(32, 64, 3, dtype=torch.uint8),),
+        videos=(torch.zeros(1, 32, 32, 3, dtype=torch.uint8),),
+        video_audios=((torch.full((400 * 800,), 0.25), 32_000),),
+        audios=((torch.full((200 * 800,), 0.5), 32_000),),
+        audio_mode=audio_mode,
+        reference_order=reference_order,
+    )
+
+
+@pytest.mark.parametrize(
+    ("reference_order", "audio_mode", "kinds", "shapes", "lengths", "visual", "audio"),
+    [
+        ((), "native", ["image", "video_audio", "audio"], ((1, 2, 4), (2, 2, 2)), (400, 200), [1.0, 2.0], [0.25, 0.5]),
+        (
+            ("image", "video", "audio"),
+            "native",
+            ["image", "video_audio", "audio"],
+            ((1, 2, 4), (2, 2, 2)),
+            (400, 200),
+            [1.0, 2.0],
+            [0.25, 0.5],
+        ),
+        (
+            ("audio", "video", "image"),
+            "native",
+            ["audio", "video_audio", "image"],
+            ((2, 2, 2), (1, 2, 4)),
+            (200, 400),
+            [2.0, 1.0],
+            [0.5, 0.25],
+        ),
+        (
+            ("video", "image", "audio"),
+            "native",
+            ["video_audio", "image", "audio"],
+            ((2, 2, 2), (1, 2, 4)),
+            (400, 200),
+            [2.0, 1.0],
+            [0.25, 0.5],
+        ),
+        (
+            ("video", "image"),
+            "lock_source",
+            ["video_audio", "image"],
+            ((2, 2, 2), (1, 2, 4)),
+            (400, 200),
+            [2.0, 1.0],
+            [0.25, 0.5],
+        ),
+    ],
+)
+def test_encode_media_emits_references_in_request_order(
+    reference_order, audio_mode, kinds, shapes, lengths, visual, audio
+) -> None:
+    from vllm_omni.diffusion.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import encode_media
+
+    media = _ordered_media(reference_order, audio_mode)
+    conditioning = encode_media(media, video_vae=_OrderVideoVAE(), audio_vae=_OrderAudioVAE(), emit_conditioning=True)
+
+    assert [block["kind"] for block in conditioning.ref_blocks] == kinds
+    ref_audio_t = {"image": 0, "video_audio": 400, "audio": 200}
+    assert [block.get("ref_audio_t", 0) for block in conditioning.ref_blocks] == [ref_audio_t[kind] for kind in kinds]
+    assert conditioning.visual_condition_shapes == shapes
+    assert conditioning.audio_condition_lengths == lengths
+    assert conditioning.visual_condition[:, 0].unique_consecutive().tolist() == visual
+    assert conditioning.audio_condition[:, 0].unique_consecutive().tolist() == audio
+    pipeline = SimpleNamespace(video_vae=_OrderVideoVAE())
+    assert MiniMaxH3Pipeline._predict_visual_condition_shapes(pipeline, media) == shapes
+
+
+@pytest.mark.parametrize("reference_order", [(), ("audio", "video", "image")])
+def test_reference_order_round_trips_through_the_media_wire(reference_order) -> None:
+    media = _ordered_media(reference_order)
+    metadata = media.to_metadata()
+
+    assert ("reference_order" in metadata) is bool(reference_order)
+    restored = MiniMaxH3EncoderMediaInput.from_mm_tensors(media.to_mm_tensors(), metadata)
+    assert restored.reference_order == reference_order
+    assert restored.reference_kinds() == (reference_order or ("image", "video", "audio"))
+
+
+def test_media_input_rejects_a_reference_order_that_misnames_references() -> None:
+    with pytest.raises(ValueError, match="name every"):
+        _ordered_media(("video", "image"))
+    with pytest.raises(ValueError, match="name every"):
+        _ordered_media(("video", "image", "audio"), "lock_source")
+    media = _ordered_media()
+    with pytest.raises(ValueError, match="kinds must be one of"):
+        MiniMaxH3EncoderMediaInput.from_mm_tensors(
+            media.to_mm_tensors(), {**media.to_metadata(), "reference_order": ["image", "video", "voice"]}
+        )
+
+
 def test_encoder_output_reuses_encoder_handoff_and_round_trips(monkeypatch) -> None:
     expected = MiniMaxH3EncoderConditioning(
         hidden_states=torch.randn(3, 5120, dtype=torch.bfloat16),

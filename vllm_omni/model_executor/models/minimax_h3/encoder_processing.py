@@ -23,9 +23,11 @@ from vllm.logger import init_logger
 from vllm_omni.errors import OmniClientError
 from vllm_omni.model_executor.models.minimax_h3 import reference_video as _reference_video
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
+    MINIMAX_H3_REFERENCE_ORDER_KEY,
     MiniMaxH3EncoderMediaConditioning,
     MiniMaxH3EncoderMediaInput,
     MiniMaxH3TimelineGuide,
+    resolve_minimax_h3_reference_order,
 )
 from vllm_omni.model_executor.models.minimax_h3.continuation_request import (
     continuation_output_frames,
@@ -864,6 +866,7 @@ def _prepare_encoder_inputs(
     task = task if task is not None else _resolve_task(extra_args, multi_modal_data)
     raw_images = load_minimax_h3_images(image_values) if image_values else []
 
+    reference_order: tuple[str, ...] = ()
     if task == "t2va":
         if raw_images or videos or (audio_values and not lock_audio):
             raise OmniClientError("t2va does not accept image, video, or audio conditions")
@@ -881,6 +884,18 @@ def _prepare_encoder_inputs(
         )
         if not raw_images and not videos and not latent_continuation:
             raise OmniClientError("ref2va requires an image or video condition")
+        requested_order = multi_modal_data.get(MINIMAX_H3_REFERENCE_ORDER_KEY)
+        if lock_audio and isinstance(requested_order, (list, tuple)):
+            requested_order = [kind for kind in requested_order if kind != "audio"]
+        try:
+            reference_order = resolve_minimax_h3_reference_order(
+                requested_order,
+                images=len(raw_images),
+                videos=len(videos),
+                audios=0 if lock_audio else len(audio_values),
+            )
+        except ValueError as exc:
+            raise OmniClientError(str(exc)) from exc
         if frame_workers > 0 and not lock_audio:
             # Standalone reference audio is probed, checked and decoded while
             # the reference images and videos are prepared.
@@ -1014,7 +1029,6 @@ def _prepare_encoder_inputs(
     if task == "fl2va":
         condition_labels.extend(("image", index) for index in range(1, len(images) + 1))
     elif task == "ref2va":
-        condition_labels.extend(("image", index) for index in range(1, len(images) + 1))
         prepared_videos: list[dict[str, Any]] = []
         if videos:
             with tempfile.TemporaryDirectory(prefix="minimax_h3_encoder_") as workdir:
@@ -1096,15 +1110,18 @@ def _prepare_encoder_inputs(
                         if item.get("frames") is not None:
                             item["frames"].cancel()
                     audio_pool.shutdown(wait=True, cancel_futures=True)
-        audio_index = 0
-        for video_index, item in enumerate(prepared_videos, start=1):
-            if item["input_has_audio"]:
-                audio_index += 1
-                condition_labels.append(("audio", audio_index))
-            condition_labels.append(("video", video_index))
-        for _ in [] if lock_audio else audio_values:
-            audio_index += 1
-            condition_labels.append(("audio", audio_index))
+        counts = dict.fromkeys(("image", "video", "audio"), 0)
+        video_has_audio = iter(item["input_has_audio"] for item in prepared_videos)
+        for kind in reference_order:
+            if kind == "video" and next(video_has_audio):
+                counts["audio"] += 1
+                condition_labels.append(("audio", counts["audio"]))
+            counts[kind] += 1
+            condition_labels.append((kind, counts[kind]))
+        if reference_order == resolve_minimax_h3_reference_order(
+            None, images=len(images), videos=len(prepared_videos), audios=0 if lock_audio else len(audio_values)
+        ):
+            reference_order = ()
 
     video_edit: torch.Tensor | None = None
     edit_video_metadata: dict[str, Any] | None = None
@@ -1192,6 +1209,7 @@ def _prepare_encoder_inputs(
         audio_edit=audio_edit,
         audio_edit_mask=audio_edit_mask,
         timeline_guides=timeline_guides,
+        reference_order=reference_order,
     )
     audio_inputs = _effective_audio_inputs(
         media_input.video_audios,
@@ -1279,6 +1297,15 @@ def _timeline_guide_conditioning(
         torch.cat(present).contiguous() if present else None,
         torch.cat(audio_rows).contiguous() if audio_rows else None,
     )
+
+
+def reference_visual_order(media: MiniMaxH3EncoderMediaInput) -> list[int]:
+    """Indices into ``images + videos`` in request order."""
+    image_slots = iter(range(len(media.images)))
+    video_slots = iter(range(len(media.images), len(media.images) + len(media.videos)))
+    return [
+        next(image_slots if kind == "image" else video_slots) for kind in media.reference_kinds() if kind != "audio"
+    ]
 
 
 def encode_media(
@@ -1407,28 +1434,46 @@ def encode_media(
             raise ValueError("MiniMax H3 audio references must be at most 15 seconds in total")
 
     ref_blocks: list[dict[str, Any]] = []
-    image_shapes = visual_shapes[: len(media.images)]
-    video_shapes = visual_shapes[len(media.images) :]
-    ref_blocks.extend({"kind": "image", "latent_h": shape[1], "latent_w": shape[2]} for shape in image_shapes)
-    embedded_lengths = iter(audio_lengths[:embedded_audio_count])
-    for shape, embedded in zip(video_shapes, media.video_audios, strict=True):
-        ref_audio_t = int(next(embedded_lengths)) if embedded is not None else 0
-        ref_blocks.append(
-            {
-                "kind": "video_audio" if ref_audio_t else "video",
-                "ref_audio_t": ref_audio_t,
-                "latent_t": shape[0],
-                "latent_h": shape[1],
-                "latent_w": shape[2],
-            }
-        )
-    ref_blocks.extend(
-        {
-            "kind": "audio",
-            "ref_audio_t": int(length),
-        }
-        for length in reference_lengths[embedded_audio_count:]
-    )
+    visual_order: list[int] = []
+    audio_order: list[int] = []
+    image_slots = iter(range(len(media.images)))
+    video_slots = iter(range(len(media.videos)))
+    embedded_rows = iter(range(embedded_audio_count))
+    standalone_rows = iter(range(embedded_audio_count, len(reference_lengths)))
+    for kind in media.reference_kinds():
+        if kind == "image":
+            index = next(image_slots)
+            shape = visual_shapes[index]
+            ref_blocks.append({"kind": "image", "latent_h": shape[1], "latent_w": shape[2]})
+            visual_order.append(index)
+        elif kind == "video":
+            video = next(video_slots)
+            index = len(media.images) + video
+            shape = visual_shapes[index]
+            ref_audio_t = 0
+            if media.video_audios[video] is not None:
+                row = next(embedded_rows)
+                ref_audio_t = int(audio_lengths[row])
+                audio_order.append(row)
+            ref_blocks.append(
+                {
+                    "kind": "video_audio" if ref_audio_t else "video",
+                    "ref_audio_t": ref_audio_t,
+                    "latent_t": shape[0],
+                    "latent_h": shape[1],
+                    "latent_w": shape[2],
+                }
+            )
+            visual_order.append(index)
+        else:
+            row = next(standalone_rows)
+            ref_blocks.append({"kind": "audio", "ref_audio_t": int(audio_lengths[row])})
+            audio_order.append(row)
+    audio_order.extend(range(len(reference_lengths), len(audio_lengths)))
+    visual_rows = [visual_rows[index] for index in visual_order]
+    visual_shapes = [visual_shapes[index] for index in visual_order]
+    audio_rows = [audio_rows[index] for index in audio_order]
+    audio_lengths = [audio_lengths[index] for index in audio_order]
     video_edit_mask = None
     if video_edit_clean_rows is not None:
         if media.video_edit_mask is None:

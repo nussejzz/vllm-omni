@@ -1364,6 +1364,7 @@ def test_r5_mixed_image_video_audio_references_and_fanout(test_client, mocker: M
     assert len(engine.captured_reference_video_bytes) == 1
     assert b"ftyp" in engine.captured_reference_video_bytes[0][:32]
     assert isinstance(multi_modal_data["audio"], str)
+    assert "minimax_h3_reference_order" not in multi_modal_data
     assert engine.captured_sampling_params_list[0].num_outputs_per_prompt == 2
 
 
@@ -1406,8 +1407,76 @@ def test_multi_video_generation_preserves_uploaded_files_until_generation(
     assert all(not Path(path).exists() for path in input_videos)
     assert isinstance(engine.captured_prompt["multi_modal_data"]["image"], Image.Image)
     assert isinstance(engine.captured_prompt["multi_modal_data"]["audio"], str)
+    assert engine.captured_prompt["multi_modal_data"]["minimax_h3_reference_order"] == [
+        "image",
+        "video",
+        "video",
+        "audio",
+    ]
     assert engine.captured_sampling_params_list[0].extra_args["task"] == "ref2va"
     assert engine.captured_sampling_params_list[0].extra_args["duration"] == 15.0
+
+
+@pytest.mark.parametrize(
+    ("audio_reference", "order"),
+    [(None, ["video", "image"]), ("data:audio/mp3;base64,ZmFrZQ==", ["video", "image", "audio"])],
+)
+def test_h3_multipart_references_record_upload_order(test_client, mocker: MockerFixture, audio_reference, order):
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    data = {"prompt": "Match the clip.", "extra_params": json.dumps({"task": "ref2va"})}
+    if audio_reference is not None:
+        data["audio_reference"] = json.dumps([{"audio_url": audio_reference}])
+    response = test_client.post(
+        "/v1/videos/sync",
+        data=data,
+        files=[
+            ("input_references", ("clip.mp4", b"reference-video", "video/mp4")),
+            ("input_references", ("subject.png", _make_test_image_bytes((40, 24)), "image/png")),
+        ],
+    )
+
+    assert response.status_code == 200
+    multi_modal_data = engine.captured_prompt["multi_modal_data"]
+    assert multi_modal_data["minimax_h3_reference_order"] == order
+    assert engine.captured_reference_video_bytes == [b"reference-video"]
+    assert isinstance(multi_modal_data["image"], Image.Image)
+    assert isinstance(multi_modal_data.get("audio"), str) is (audio_reference is not None)
+
+
+def test_h3_lock_source_upload_order_is_accepted_by_the_encoder(test_client, mocker: MockerFixture):
+    from vllm_omni.model_executor.models.minimax_h3.encoder_processing import prepare_encoder_inputs
+
+    mocker.patch(
+        "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
+        return_value=b"fake-video",
+    )
+    engine = test_client.app.state.openai_serving_video._engine_client
+    engine.model_class_name = "MiniMaxH3Pipeline"
+    response = test_client.post(
+        "/v1/videos/sync",
+        data={
+            "prompt": "Sing along.",
+            "extra_params": json.dumps({"task": "ref2va", "audio_mode": "lock_source"}),
+        },
+        files=[
+            ("input_references", ("image_1.png", _make_test_image_bytes((256, 256)), "image/png")),
+            ("input_references", ("audio_1.mp3", b"driving-audio", "audio/mpeg")),
+        ],
+    )
+    assert response.status_code == 200
+    multi_modal_data = {**engine.captured_prompt["multi_modal_data"], "audio": [np.zeros(32_000), 16_000]}
+    sampling = OmniDiffusionSamplingParams(
+        height=256, width=448, extra_args=engine.captured_sampling_params_list[0].extra_args
+    )
+
+    prepared = prepare_encoder_inputs({"prompt": "Sing along.", "multi_modal_data": multi_modal_data}, sampling)
+
+    assert prepared.condition_labels == [("image", 1)]
 
 
 def test_mixed_reference_capability_uses_model_metadata_when_config_defaults_false(test_client):

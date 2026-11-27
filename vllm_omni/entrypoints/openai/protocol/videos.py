@@ -380,6 +380,7 @@ class VideoGenerationRequest(BaseModel):
     # MiniMax H3 control uploads by role (``control_path``/``source_path``/``mask_path``),
     # forwarded in ``multi_modal_data`` so client-supplied ``extra_params`` cannot name paths.
     _minimax_h3_control_media: dict[str, str] = PrivateAttr(default_factory=dict)
+    _minimax_h3_reference_order: list[str] = PrivateAttr(default_factory=list)
 
     # Generic model-specific parameters
     extra_params: dict[str, Any] | None = Field(

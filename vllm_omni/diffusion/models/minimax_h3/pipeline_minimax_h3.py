@@ -103,6 +103,7 @@ from vllm_omni.model_executor.models.minimax_h3.encoder_processing import (
     continuation_inherits_source_canvas,
     encode_media,
     prepare_encoder_inputs,
+    reference_visual_order,
 )
 from vllm_omni.model_executor.models.minimax_h3.long_video import validate_encoded_frame_limit
 from vllm_omni.model_executor.models.minimax_h3.preprocessing import (
@@ -3478,7 +3479,7 @@ class MiniMaxH3Pipeline(
         for video in media.videos:
             frames = np.asarray(video.detach().cpu().to(torch.uint8).contiguous().numpy())
             shapes.append(self.video_vae.predict_video_latent_shape(frames))
-        return tuple(shapes)
+        return tuple(shapes[index] for index in reference_visual_order(media))
 
     def _prepare_local_conditioning(
         self,
