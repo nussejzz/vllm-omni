@@ -25,6 +25,7 @@ from vllm_omni.diffusion.models.minimax_h3.denoise_loop import minimax_h3_denois
 from vllm_omni.diffusion.models.minimax_h3.latent_cache import CachedClip, plan_latent_continuation
 from vllm_omni.diffusion.models.minimax_h3.packed_sequence import minimax_h3_packed_sequence_ref2va_blocks
 from vllm_omni.diffusion.models.minimax_h3.packed_tokens import (
+    minimax_h3_pack_audio_latent,
     minimax_h3_unpack_audio_tokens,
     minimax_h3_unpatchify_video_tokens,
 )
@@ -929,3 +930,126 @@ def test_client_seed_schedule_avoids_correlated_streams():
     assert not any(b - a in forbidden for i, a in enumerate(seeds) for b in seeds[i + 1 :])
     legacy = [base + 10007 * k + 500000 * r for base in (0, 500000) for k in range(30) for r in range(6)]
     assert any(b - a in forbidden for i, a in enumerate(legacy) for b in legacy[i + 1 :])
+
+
+def _run_hop(end, seam, *, total=124):
+    lookahead = seam.lookahead if seam is not None else 0
+    start = end + lookahead - 124
+    generator = torch.Generator().manual_seed(end)
+    clip = CachedClip(
+        video=torch.randn(1, 24, _video_t(124), LATENT_H, LATENT_W, generator=generator),
+        audio=torch.randn(2, 32, _audio_t(start + 124) - _audio_t(start), generator=generator),
+        start_frame=start,
+        num_frames=124,
+    )
+    plan = plan_latent_continuation(
+        clip, ContinuationRequest("a", 22), num_frames=total, latent_h=LATENT_H, latent_w=LATENT_W, lookahead=lookahead
+    )
+    assert plan.prefix.start_frame + plan.prefix.overlap_frames == end
+    kwargs = _kwargs(total, **({} if seam is None else {"seam": seam}))
+    kwargs["audio_t"] = plan.audio_t
+    calls, outputs = [], []
+
+    def diffuse(**kw):
+        calls.append(kw)
+        base = 1e6 * len(calls)
+        video = base + torch.arange(24 * kw["latent_t"] * LATENT_H * LATENT_W, dtype=torch.float32)
+        audio = base + torch.arange(2 * 32 * kw["audio_t"], dtype=torch.float32)
+        outputs.append((video.reshape(1, 24, kw["latent_t"], LATENT_H, LATENT_W), audio.reshape(2, 32, kw["audio_t"])))
+        return outputs[-1]
+
+    video, audio = diffuse_continuation(diffuse, kwargs, window_frames=277, overlap_frames=22, prefix=plan.prefix)
+    assert video.shape[2] == kwargs["latent_t"] and audio.shape[-1] == kwargs["audio_t"]
+    return plan.prefix, calls, outputs, video, audio
+
+
+def _assert_hop_audio(prefix, call, sampled, audio, kept, *, pinned):
+    audio_t = call["audio_t"]
+    tail = prefix.audio[..., :kept]
+    guide = call["guide_blocks"][0]
+    assert guide["kind"] == "video_audio" and guide["latent_t"] == 7
+    assert guide["ref_audio_t"] == call["audio_condition_lengths"][0] == kept
+    assert torch.equal(call["audio_condition"], minimax_h3_pack_audio_latent(tail))
+    if pinned:
+        rows, values, groups = call["pins"][1]
+        steps = torch.arange(kept)
+        assert groups == 1 and torch.equal(rows, torch.cat((steps, steps + audio_t)))
+        packed = torch.zeros(2 * audio_t, 32)
+        packed[rows] = values
+        unpacked = minimax_h3_unpack_audio_tokens(packed, audio_t=2 * audio_t, audio_channel=2)
+        assert torch.equal(unpacked[..., :kept], tail) and torch.all(unpacked[..., kept:] == 0)
+    else:
+        assert "pins" not in call
+    assert torch.equal(audio[..., :audio_t], torch.cat((tail, sampled[..., kept:]), dim=-1))
+
+
+@pytest.mark.parametrize("end", [124, 226, 277])
+def test_pin_regenerates_the_parent_audio_latent_past_its_last_frame(end):
+    prefix, calls, outputs, video, audio = _run_hop(end, SeamOptions(pin="all"))
+    assert end % 3 == 1 and prefix.audio.shape[-1] == 37 and len(calls) == 1
+    (call,), ((sampled_video, sampled_audio),) = calls, outputs
+    _assert_hop_audio(prefix, call, sampled_audio, audio, 36, pinned=True)
+    assert call["pins"][0][2] == 7 and call["pins"][0][0].numel() == 7 * (LATENT_H // 2) * (LATENT_W // 2)
+    assert audio.shape[-1] == call["audio_t"] == 207
+    assert torch.equal(audio, torch.cat((prefix.audio[..., :36], sampled_audio[..., 36:]), dim=-1))
+    assert torch.equal(video, torch.cat((prefix.video, sampled_video[:, :, 7:]), dim=2))
+
+
+def test_pin_drops_only_the_prefix_audio_latent_across_windows():
+    prefix, calls, outputs, _, audio = _run_hop(124, SeamOptions(pin="all"), total=702)
+    windows = plan_continuation_windows(702, 277, 22, first_overlap=22, origin=102)
+    assert len(calls) == len(windows) == 3
+    _assert_hop_audio(prefix, calls[0], outputs[0][1], audio, 36, pinned=True)
+    bounds = [_audio_t(window.end) - _audio_t(102) for window in windows]
+    for index, window in enumerate(windows[1:], 1):
+        count, cut = window.overlap_audio_t, bounds[index - 1]
+        assert count == 37 and calls[index]["pins"][1][0].numel() == 2 * count
+        assert calls[index]["audio_condition_lengths"][-1] == count
+        assert torch.equal(calls[index]["audio_condition"], minimax_h3_pack_audio_latent(audio[..., cut - count : cut]))
+        assert torch.equal(audio[..., cut : bounds[index]], outputs[index][1][..., count:])
+    assert audio.shape[-1] == bounds[-1] == _audio_t(804) - _audio_t(102)
+
+
+@pytest.mark.parametrize("end,count", [(141, 37), (243, 37), (158, 36), (260, 36)])
+def test_pin_keeps_the_prefix_audio_that_ends_inside_the_last_frame(end, count):
+    prefix, calls, outputs, _, audio = _run_hop(end, SeamOptions(pin="all"))
+    assert end % 3 != 1 and prefix.audio.shape[-1] == count
+    _assert_hop_audio(prefix, calls[0], outputs[0][1], audio, count, pinned=True)
+    assert audio.shape[-1] == calls[0]["audio_t"]
+
+
+@pytest.mark.parametrize(
+    "seam",
+    [
+        None,
+        SeamOptions(),
+        SeamOptions(diag=True),
+        SeamOptions(pin="all", lookahead=17),
+        SeamOptions(pin="all", lookahead=34),
+    ],
+)
+def test_unpinned_or_lookahead_hops_keep_the_whole_prefix_audio(seam):
+    prefix, calls, outputs, _, audio = _run_hop(124, seam)
+    assert prefix.audio.shape[-1] == 37
+    pinned = seam is not None and seam.pin != "none"
+    _assert_hop_audio(prefix, calls[0], outputs[0][1], audio, 37, pinned=pinned)
+    assert audio.shape[-1] == calls[0]["audio_t"] == 207
+
+
+@pytest.mark.parametrize("total", [124, 702])
+@pytest.mark.parametrize("end", [124, 141])
+def test_chunk_pin_behind_a_prefix_keeps_cumulative_lengths(end, total):
+    prefix, calls, outputs, video, audio = _run_hop(end, SeamOptions(pin="chunk"), total=total)
+    start = end - 22
+    count = _audio_t(start + 17) - _audio_t(start)
+    call, (sampled_video, sampled_audio) = calls[0], outputs[0]
+    assert call["pins"][0][2] == 5 and call["pins"][1][0].numel() == 2 * count
+    assert call["audio_condition_lengths"][0] == prefix.audio.shape[-1] - (end % 3 == 1)
+    expected_v = torch.cat((prefix.video[:, :, :5], sampled_video[:, :, 5:]), dim=2)
+    expected_a = torch.cat((prefix.audio[..., :count], sampled_audio[..., count:]), dim=-1)
+    keep_v, keep_a = call["latent_t"], call["audio_t"]
+    if total > 124:
+        keep_v, keep_a = keep_v - 7, keep_a - 37
+    assert torch.equal(video[:, :, :keep_v], expected_v[:, :, :keep_v])
+    assert torch.equal(audio[..., :keep_a], expected_a[..., :keep_a])
+    assert (video.shape[2] == keep_v) == (audio.shape[-1] == keep_a) == (total == 124)

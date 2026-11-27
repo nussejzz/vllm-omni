@@ -406,6 +406,10 @@ def diffuse_continuation(
     # anchored after the longest prefix so text length cannot shift AV time.
     media_time_origin = max(item[0].shape[0] for item in text_conditioning) if text_conditioning else None
     video, audio = (prefix.video, prefix.audio) if prefix is not None else (None, None)
+    if prefix is not None and seam is not None and seam.pin != "none" and not lookahead:
+        end = prefix.start_frame + prefix.overlap_frames
+        if _audio_t(end) * 3 > end * 5:
+            audio = audio[..., :-1]
     for index, window in enumerate(windows):
         if index and lookahead:
             video = video[:, :, : _video_t(window.start + window.overlap - origin)]
@@ -451,11 +455,12 @@ def diffuse_continuation(
         if video is None or audio is None:
             video, audio = sampled_video, sampled_audio
         else:
-            keep_v, keep_a = overlap_v, window.overlap_audio_t
+            tail_a = int(audio_tail.shape[-1])
+            keep_v, keep_a = overlap_v, tail_a
             if seam is not None and seam.pin == "chunk":
                 keep_v, keep_a = _CHUNK_LATENTS, _audio_t(window.start + _CHUNK_FRAMES) - window.audio_start
                 video = video[:, :, : video.shape[2] - overlap_v + keep_v]
-                audio = audio[..., : audio.shape[-1] - window.overlap_audio_t + keep_a]
+                audio = audio[..., : audio.shape[-1] - tail_a + keep_a]
             video = torch.cat((video, sampled_video[:, :, keep_v:].to(video.device)), dim=2)
             audio = torch.cat((audio, sampled_audio[..., keep_a:].to(audio.device)), dim=-1)
     assert video is not None and audio is not None
